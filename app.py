@@ -1,8 +1,8 @@
-# app.py
 from __future__ import annotations
 
 import os
 import re
+import socket
 from typing import Tuple
 from urllib.parse import quote_plus
 
@@ -11,67 +11,54 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import SQLAlchemyError
 
 
-# ============================================================
+# -----------------------------
 # Env helpers
-# ============================================================
-
+# -----------------------------
 def env_any(*names: str) -> str:
     for n in names:
         v = os.getenv(n)
         if v is not None and str(v).strip():
-            return str(v)
+            return str(v).strip()
     return ""
 
 
-# ============================================================
-# Build MySQL URL (APP_* ALWAYS wins)
-# ============================================================
+# -----------------------------
+# Build DB URL (APP_* wins)
+# -----------------------------
+def build_mysql_components() -> dict:
+    app_user = env_any("APP_MYSQL_USER")
+    app_pw = env_any("APP_MYSQL_PASSWORD")
 
-def build_raw_mysql_url() -> str:
-    app_user = env_any("APP_MYSQL_USER").strip()
-    app_pw = env_any("APP_MYSQL_PASSWORD").strip()
+    # We intentionally DO NOT use MYSQL_USER/MYSQL_PASSWORD anymore.
+    # Only APP_* should be credentials.
+    host = env_any("MYSQL_HOST")
+    port = env_any("MYSQL_PORT")
+    db = env_any("MYSQL_DATABASE")
 
-    rail_user = env_any("MYSQL_USER", "MYSQLUSER").strip()
-    rail_pw = env_any("MYSQL_PASSWORD", "MYSQLPASSWORD").strip()
+    using = "APP_MYSQL_*" if (app_user and app_pw) else "MISSING_APP_CREDS"
 
-    if app_user and app_pw:
-        user, pw = app_user, app_pw
-    else:
-        user, pw = rail_user, rail_pw
+    return {
+        "using": using,
+        "user": app_user,
+        "pw": app_pw,
+        "host": host,
+        "port": port,
+        "db": db,
+    }
 
-    # Railway blocks root
+
+def normalize_sqlalchemy_url(user: str, pw: str, host: str, port: str, db: str) -> str:
+    if not all([user, pw, host, port, db]):
+        raise RuntimeError("Missing one or more required DB fields (user/pw/host/port/db).")
+
     if user.lower() == "root":
-        return ""
+        raise RuntimeError("Root is blocked. Use a non-root user (app_ro).")
 
-    host = env_any("MYSQL_HOST", "MYSQLHOST").strip()
-    port = env_any("MYSQL_PORT", "MYSQLPORT").strip()
-    db = (
-        env_any("MYSQL_DATABASE")
-        or env_any("MYSQL_DB")
-        or env_any("MYSQL_DEFAULT_DB")
-        or ""
-    ).strip()
-
-    if all([user, pw, host, port, db]):
-        return f"mysql://{user}:{pw}@{host}:{port}/{db}"
-
-    return ""
-
-
-def normalize_sqlalchemy_url(raw: str) -> str:
-    if not raw:
-        raise RuntimeError("Database URL is empty")
-
-    s = raw.strip().strip('"').strip("'")
-
-    # Force PyMySQL
-    if s.startswith("mysql://"):
-        s = s.replace("mysql://", "mysql+pymysql://", 1)
-    else:
-        s = re.sub(r"^mysql\+[^:]+://", "mysql+pymysql://", s)
+    # Build raw mysql URL then normalize to mysql+pymysql
+    raw = f"mysql://{user}:{pw}@{host}:{port}/{db}"
+    s = raw.replace("mysql://", "mysql+pymysql://", 1)
 
     u = make_url(s)
     u = u.set(
@@ -81,17 +68,9 @@ def normalize_sqlalchemy_url(raw: str) -> str:
     return str(u)
 
 
-# ============================================================
-# SQLAlchemy engine
-# ============================================================
-
 @st.cache_resource(show_spinner=False)
-def get_engine(url: str) -> Engine:
-    return create_engine(
-        url,
-        pool_pre_ping=True,
-        pool_recycle=1800,
-    )
+def get_engine(sqlalchemy_url: str) -> Engine:
+    return create_engine(sqlalchemy_url, pool_pre_ping=True, pool_recycle=1800)
 
 
 def test_engine(engine: Engine) -> Tuple[bool, str]:
@@ -103,10 +82,9 @@ def test_engine(engine: Engine) -> Tuple[bool, str]:
         return False, str(e)
 
 
-# ============================================================
-# SQL helpers
-# ============================================================
-
+# -----------------------------
+# SQL safety helpers
+# -----------------------------
 SQL_CODEBLOCK_RE = re.compile(r"```sql\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
 
@@ -116,31 +94,29 @@ def extract_sql(txt: str) -> str:
 
 
 def normalize_sql(sql: str) -> str:
-    return sql.rstrip(";").strip() + ";"
+    return (sql or "").strip().rstrip(";") + ";"
 
 
 def is_read_only_sql(sql: str) -> bool:
-    low = re.sub(r"\s+", " ", sql.lower())
+    low = re.sub(r"\s+", " ", (sql or "").strip().lower())
     if not (low.startswith("select") or low.startswith("with")):
         return False
     banned = [
-        "insert", "update", "delete", "drop", "alter", "truncate",
-        "create", "replace", "grant", "revoke", "commit", "rollback",
-        "call", "load data", "outfile",
+        "insert", "update", "delete", "drop", "alter", "truncate", "create", "replace",
+        "grant", "revoke", "commit", "rollback", "call", "load data", "outfile",
     ]
     return not any(re.search(rf"\b{b}\b", low) for b in banned)
 
 
 def ensure_limit(sql: str, limit: int = 200) -> str:
-    low = sql.lower()
-    if "limit" in low or "count(" in low:
-        return sql
-    return sql.rstrip(";") + f" LIMIT {limit};"
+    s = normalize_sql(sql)
+    low = s.lower()
+    if re.search(r"\blimit\s+\d+\b", low):
+        return s
+    if low.startswith("select") and "count(" not in low:
+        return s.rstrip(";") + f" LIMIT {limit};"
+    return s
 
-
-# ============================================================
-# LLM helpers
-# ============================================================
 
 def get_llm(api_key: str, model: str):
     from langchain_openai import ChatOpenAI
@@ -155,39 +131,31 @@ def fetch_schema(engine: Engine, db: str) -> str:
         ORDER BY TABLE_NAME, ORDINAL_POSITION
     """)
     df = pd.read_sql(q, engine, params={"db": db})
-    out = []
+    lines = []
     for t, g in df.groupby("TABLE_NAME"):
         cols = ", ".join(f"{r.COLUMN_NAME}({r.DATA_TYPE})" for r in g.itertuples(index=False))
-        out.append(f"- {t}: {cols}")
-    return "\n".join(out)
+        lines.append(f"- {t}: {cols}")
+    return "\n".join(lines)
 
 
 def generate_sql(llm, schema: str, question: str) -> str:
-    prompt = f"""
-You are a senior data analyst writing MySQL queries.
-
-Rules:
-- Return ONLY SQL
-- Read-only (SELECT / WITH)
-- Use only the schema below
-
-SCHEMA:
-{schema}
-
-QUESTION:
-{question}
-"""
-    raw = llm.invoke(prompt).content
+    system = (
+        "You are a senior data analyst writing MySQL queries.\n"
+        "Rules:\n"
+        "- Return ONLY the SQL query (no explanation).\n"
+        "- SQL MUST be read-only (SELECT or WITH only).\n"
+        "- Use only tables/columns from the provided schema.\n"
+    )
+    user = f"SCHEMA:\n{schema}\n\nQUESTION:\n{question}\n\nReturn ONLY SQL."
+    raw = llm.invoke([{"role": "system", "content": system}, {"role": "user", "content": user}]).content
     sql = extract_sql(raw)
-    sql = normalize_sql(sql)
-    sql = ensure_limit(sql)
+    sql = ensure_limit(sql, 200)
     return sql
 
 
 # ============================================================
 # Streamlit UI
 # ============================================================
-
 st.set_page_config(page_title="NL → SQL (MySQL) Agent", layout="wide")
 st.title("Natural Language → SQL Agent (MySQL) — DataFrame Results")
 
@@ -205,70 +173,56 @@ with st.sidebar:
     st.header("DB Debug (safe)")
     st.write("APP_MYSQL_USER set:", bool(env_any("APP_MYSQL_USER")))
     st.write("APP_MYSQL_PASSWORD set:", bool(env_any("APP_MYSQL_PASSWORD")))
-    st.write("MYSQL_HOST:", env_any("MYSQL_HOST"))
-    st.write("MYSQL_PORT:", env_any("MYSQL_PORT"))
-    st.write("MYSQL_DATABASE:", env_any("MYSQL_DATABASE"))
+    st.write("MYSQL_HOST present:", bool(env_any("MYSQL_HOST")))
+    st.write("MYSQL_PORT present:", bool(env_any("MYSQL_PORT")))
+    st.write("MYSQL_DATABASE present:", bool(env_any("MYSQL_DATABASE")))
 
 if clear_cache:
     get_engine.clear()
-    st.success("DB cache cleared")
+    st.success("DB cache cleared ✅")
 
-raw_url = build_raw_mysql_url()
-if not raw_url:
-    st.error("Invalid DB credentials or root user detected.")
-    st.stop()
+cfg = build_mysql_components()
 
-try:
-    sqlalchemy_url = normalize_sqlalchemy_url(raw_url)
-    parsed = make_url(sqlalchemy_url)
-    db_name = parsed.database
-except Exception as e:
-    st.error(f"DB URL error: {e}")
-    st.stop()
-
-engine = get_engine(sqlalchemy_url)
-
-# 🔴 CRITICAL DEBUG: show exactly which DB the app hits
+# Connection status expander
 with st.expander("Connection status", expanded=True):
+    st.write("Using creds:", cfg["using"])
+    st.write("Using user:", cfg["user"] or "(missing)")
+    st.write("Host:", cfg["host"] or "(missing)", "Port:", cfg["port"] or "(missing)", "DB:", cfg["db"] or "(missing)")
+
+    # DNS resolution (works even if DB auth fails)
     try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT @@hostname, @@port, DATABASE(), CURRENT_USER()")
-            ).fetchone()
-        st.write("APP CONNECTS TO:", row)
+        addrs = socket.getaddrinfo(cfg["host"], int(cfg["port"]), proto=socket.IPPROTO_TCP)
+        uniq = sorted({a[4][0] for a in addrs})
+        st.write("DNS resolves to:", uniq[:10])
     except Exception as e:
-        st.error(e)
+        st.write("DNS resolution failed:", str(e))
 
-    ok, msg = test_engine(engine)
-    st.write(f"Engine: {'✅ OK' if ok else '❌ FAIL'}")
-    if not ok:
-        st.code(msg)
+    # Build engine + test
+    try:
+        sqlalchemy_url = normalize_sqlalchemy_url(cfg["user"], cfg["pw"], cfg["host"], cfg["port"], cfg["db"])
+        engine = get_engine(sqlalchemy_url)
+        ok, msg = test_engine(engine)
+        st.write(f"Engine: {'✅ OK' if ok else '❌ FAIL'}")
+        if not ok:
+            st.code(msg)
+    except Exception as e:
+        st.write("Engine: ❌ FAIL")
+        st.code(str(e))
+        st.stop()
 
-
-# ============================================================
-# Main query flow
-# ============================================================
-
+# Main UI
 st.subheader("Ask a question")
-question = st.text_area(
-    "Example: Which country's customers spent the most by invoice?",
-    height=90,
-)
+question = st.text_area("Example: Which country's customers spent the most by invoice?", height=90)
 
 if st.button("Run Query"):
     if not openai_key:
         st.error("Missing OPENAI_API_KEY")
         st.stop()
 
-    ok, msg = test_engine(engine)
-    if not ok:
-        st.error(msg)
-        st.stop()
-
     llm = get_llm(openai_key, openai_model)
 
     with st.spinner("Reading schema..."):
-        schema = fetch_schema(engine, db_name)
+        schema = fetch_schema(engine, cfg["db"])
 
     with st.spinner("Generating SQL..."):
         sql = generate_sql(llm, schema, question)
@@ -277,7 +231,7 @@ if st.button("Run Query"):
     st.code(sql, language="sql")
 
     if not is_read_only_sql(sql):
-        st.error("Blocked non-read-only SQL")
+        st.error("Blocked: generated SQL is not read-only.")
         st.stop()
 
     with st.spinner("Running query..."):
