@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual env
+venv/
+venv311/
+.env
+
+# Streamlit / OS
+.streamlit/
+.DS_Store
+Thumbs.db
+
+# Temp
+*.log
+*.tmp
