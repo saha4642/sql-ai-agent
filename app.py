@@ -210,7 +210,12 @@ st.set_page_config(page_title="NL → SQL (MySQL) Agent", layout="wide")
 st.title("Natural Language → SQL Agent (MySQL) — DataFrame Results")
 
 # --- Defaults from env (Railway-friendly)
-ENV_MYSQL_URL = os.getenv("MYSQL_URL", "")
+ENV_MYSQL_URL = (
+    os.getenv("MYSQL_PUBLIC_URL")
+    or os.getenv("MYSQL_URL")
+    or ""
+)
+
 ENV_DATABASE_URL = os.getenv("DATABASE_URL", "")
 ENV_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
