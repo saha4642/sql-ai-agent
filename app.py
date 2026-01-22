@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Optional, Tuple
+from typing import List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -11,30 +11,38 @@ from mysql.connector import Error as MySQLError
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.engine.url import URL
 
 from langchain_openai import ChatOpenAI
 
-
-# ============================
-# Helpers: env + safety guards
-# ============================
+# ============================================================
+# Helpers
+# ============================================================
 
 SQL_CODEBLOCK_RE = re.compile(r"```sql\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
-def env_get(*names: str, default: Optional[str] = None) -> Optional[str]:
-    """Return the first non-empty env var from names."""
-    for n in names:
-        v = os.getenv(n)
-        if v is not None and str(v).strip() != "":
-            return v
-    return default
+# Read-only guard (blocks any DDL/DML)
+BLOCKED_KEYWORDS = [
+    "insert", "update", "delete", "drop", "alter", "truncate", "create", "replace",
+    "grant", "revoke", "commit", "rollback", "call", "delimiter", "load", "outfile",
+]
 
-def to_int(v: str, default: int) -> int:
+def parse_port(port_value: str, default: int = 3306) -> int:
     try:
-        return int(str(v).strip())
+        return int(str(port_value).strip())
     except Exception:
         return default
+
+def safe_env(key: str, default: str = "") -> str:
+    v = os.getenv(key, "")
+    return v if v.strip() else default
+
+def build_mysql_uri(user: str, password: str, host: str, port: int, db: str) -> str:
+    # URL-encoding passwords can be necessary if it contains special chars.
+    # For simplicity, keep as-is; if you hit issues, replace with urllib.parse.quote_plus(password).
+    return f"mysql+mysqlconnector://{user}:{password}@{host}:{port}/{db}"
+
+def get_llm(api_key: str, model: str, temperature: float = 0.0) -> ChatOpenAI:
+    return ChatOpenAI(api_key=api_key, model=model, temperature=temperature)
 
 def extract_sql(text_out: str) -> str:
     m = SQL_CODEBLOCK_RE.search(text_out or "")
@@ -48,29 +56,18 @@ def normalize_sql(sql: str) -> str:
     return s + ";"
 
 def is_read_only_sql(sql: str) -> bool:
-    """
-    Strong read-only guard:
-    - Must start with SELECT or WITH
-    - Must not contain write/ddl keywords
-    """
     s = (sql or "").strip()
     low = re.sub(r"\s+", " ", s.lower())
 
     if not (low.startswith("select") or low.startswith("with")):
         return False
 
-    blocked = [
-        "insert", "update", "delete", "drop", "alter", "truncate", "create", "replace",
-        "grant", "revoke", "commit", "rollback",
-    ]
-    return not any(re.search(rf"\b{k}\b", low) for k in blocked)
+    return not any(re.search(rf"\b{k}\b", low) for k in BLOCKED_KEYWORDS)
 
 def ensure_limit(sql: str, default_limit: int = 200) -> str:
     """
-    Adds LIMIT <default_limit> only if:
-    - It's a SELECT query
-    - AND there is no existing LIMIT
-    - AND it's not a COUNT aggregate query
+    Adds LIMIT if missing and query isn't a pure COUNT aggregate.
+    Prevents duplicate LIMIT.
     """
     s = normalize_sql(sql)
     low = re.sub(r"\s+", " ", s.lower())
@@ -78,18 +75,30 @@ def ensure_limit(sql: str, default_limit: int = 200) -> str:
     if re.search(r"\blimit\s+\d+\b", low):
         return s
 
+    # don't limit a pure count query
     if low.startswith("select") and ("count(" not in low):
         return s.rstrip(";") + f" LIMIT {default_limit};"
 
     return s
 
+def fetch_schema_summary(engine: Engine, max_tables: int = 200) -> str:
+    q = text("""
+        SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = :db
+        ORDER BY TABLE_NAME, ORDINAL_POSITION
+    """)
+    db = engine.url.database
+    df = pd.read_sql(q, engine, params={"db": db})
 
-# ============================
-# LLM
-# ============================
-
-def get_llm(api_key: str, model: str = "gpt-4o-mini", temperature: float = 0.0) -> ChatOpenAI:
-    return ChatOpenAI(api_key=api_key, model=model, temperature=temperature)
+    lines = []
+    for tname, g in df.groupby("TABLE_NAME"):
+        cols = ", ".join([f"{r.COLUMN_NAME}({r.DATA_TYPE})" for r in g.itertuples(index=False)])
+        lines.append(f"- {tname}: {cols}")
+        if len(lines) >= max_tables:
+            lines.append("... (schema truncated)")
+            break
+    return "\n".join(lines)
 
 def generate_sql_from_question(llm: ChatOpenAI, schema: str, question: str) -> str:
     system = (
@@ -117,55 +126,82 @@ def generate_sql_from_question(llm: ChatOpenAI, schema: str, question: str) -> s
     sql = ensure_limit(sql, default_limit=200)
     return sql
 
-
-# ============================
-# Database: SQLAlchemy + mysql-connector
-# ============================
-
-def build_engine(user: str, password: str, host: str, port: int, db: str) -> Engine:
-    # URL.create safely escapes user/pass
-    url = URL.create(
-        drivername="mysql+mysqlconnector",
-        username=user,
-        password=password,
-        host=host,
-        port=port,
-        database=db,
-    )
-    return create_engine(url, pool_pre_ping=True)
-
-def fetch_schema_summary(engine: Engine, max_tables: int = 200) -> str:
-    q = text("""
-        SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = :db
-        ORDER BY TABLE_NAME, ORDINAL_POSITION
-    """)
-    db = engine.url.database
-    df = pd.read_sql(q, engine, params={"db": db})
-
-    lines = []
-    for tname, g in df.groupby("TABLE_NAME"):
-        cols = ", ".join([f"{r.COLUMN_NAME}({r.DATA_TYPE})" for r in g.itertuples(index=False)])
-        lines.append(f"- {tname}: {cols}")
-        if len(lines) >= max_tables:
-            lines.append("... (schema truncated)")
-            break
-    return "\n".join(lines)
-
 def run_sql_to_df(engine: Engine, sql: str) -> pd.DataFrame:
     return pd.read_sql(text(sql), engine)
 
-def test_connection_mysql(host: str, port: int, user: str, password: str, db: Optional[str] = None) -> None:
-    conn = mysql.connector.connect(host=host, port=port, user=user, password=password, database=db)
-    cur = conn.cursor()
-    cur.execute("SELECT 1;")
-    cur.fetchall()
-    cur.close()
-    conn.close()
+# ============================================================
+# SQL Import (no cursor.execute(..., multi=True) to avoid errors)
+# ============================================================
 
-def create_database_mysql(host: str, port: int, user: str, password: str, db_name: str) -> None:
-    conn = mysql.connector.connect(host=host, port=port, user=user, password=password)
+def has_delimiter(sql_text: str) -> bool:
+    return bool(re.search(r"(?im)^\s*delimiter\s+", sql_text or ""))
+
+def strip_sql_comments(sql_text: str) -> str:
+    """
+    Remove common SQL comments:
+    - -- ...
+    - # ...
+    - /* ... */
+    Keep it simple (good enough for typical sample DB scripts).
+    """
+    s = sql_text or ""
+    # remove /* ... */
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.DOTALL)
+    # remove -- ... and # ...
+    s = re.sub(r"(?m)^\s*--.*?$", "", s)
+    s = re.sub(r"(?m)^\s*#.*?$", "", s)
+    return s
+
+def split_sql_statements(sql_text: str) -> List[str]:
+    """
+    Split statements by semicolon; respects simple quoted strings.
+    Not perfect for every SQL file, but works for most sample DB dumps.
+    """
+    s = strip_sql_comments(sql_text)
+    s = s.replace("\r\n", "\n")
+
+    stmts: List[str] = []
+    buff: List[str] = []
+    in_single = False
+    in_double = False
+
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_double:
+            # toggle single unless escaped
+            prev = s[i - 1] if i > 0 else ""
+            if prev != "\\":
+                in_single = not in_single
+        elif ch == '"' and not in_single:
+            prev = s[i - 1] if i > 0 else ""
+            if prev != "\\":
+                in_double = not in_double
+
+        if ch == ";" and not in_single and not in_double:
+            stmt = "".join(buff).strip()
+            if stmt:
+                stmts.append(stmt)
+            buff = []
+        else:
+            buff.append(ch)
+
+        i += 1
+
+    tail = "".join(buff).strip()
+    if tail:
+        stmts.append(tail)
+
+    return stmts
+
+def mysql_admin_connect(host: str, port: int, user: str, password: str, database: Optional[str] = None):
+    kwargs = dict(host=host, port=port, user=user, password=password)
+    if database:
+        kwargs["database"] = database
+    return mysql.connector.connect(**kwargs)
+
+def create_database_if_needed(host: str, port: int, admin_user: str, admin_pass: str, db_name: str) -> None:
+    conn = mysql_admin_connect(host, port, admin_user, admin_pass)
     cur = conn.cursor()
     cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}`;")
     conn.commit()
@@ -175,255 +211,234 @@ def create_database_mysql(host: str, port: int, user: str, password: str, db_nam
 def ensure_nlq_user_and_grants(
     host: str,
     port: int,
-    root_user: str,
-    root_password: str,
-    db_name: str,
+    admin_user: str,
+    admin_pass: str,
     nlq_user: str,
-    nlq_password: str,
+    nlq_pass: str,
+    db_name: str,
 ) -> None:
     """
-    Creates nlq_user if missing and grants SELECT on db_name.*.
-    Uses root credentials.
+    Create nlq user and grant read-only privileges on db_name.*.
+    We grant for both '%' and 'localhost' to cover local and hosted use.
     """
-    conn = mysql.connector.connect(host=host, port=port, user=root_user, password=root_password)
+    conn = mysql_admin_connect(host, port, admin_user, admin_pass)
     cur = conn.cursor()
 
-    # Create user if not exists
-    cur.execute(f"CREATE USER IF NOT EXISTS '{nlq_user}'@'%' IDENTIFIED BY %s;", (nlq_password,))
-    # Grant only SELECT
-    cur.execute(f"GRANT SELECT ON `{db_name}`.* TO '{nlq_user}'@'%';")
-    cur.execute("FLUSH PRIVILEGES;")
-    conn.commit()
+    # Create user for '%' (common for hosted) and localhost (local dev)
+    cur.execute(f"CREATE USER IF NOT EXISTS '{nlq_user}'@'%' IDENTIFIED BY %s;", (nlq_pass,))
+    cur.execute(f"CREATE USER IF NOT EXISTS '{nlq_user}'@'localhost' IDENTIFIED BY %s;", (nlq_pass,))
 
+    # Read-only grants
+    grant_sql = f"GRANT SELECT, SHOW VIEW ON `{db_name}`.* TO '{nlq_user}'@'%';"
+    grant_sql2 = f"GRANT SELECT, SHOW VIEW ON `{db_name}`.* TO '{nlq_user}'@'localhost';"
+    cur.execute(grant_sql)
+    cur.execute(grant_sql2)
+    cur.execute("FLUSH PRIVILEGES;")
+
+    conn.commit()
     cur.close()
     conn.close()
 
-def _split_sql_statements_basic(sql_text: str) -> list[str]:
-    """
-    Very simple SQL splitter.
-    Works for most sample datasets (Chinook, many Sakila dumps) that don't use DELIMITER/procedures.
-    If your file uses procedures/triggers/DELIMITER, import via mysqlsh SOURCE instead.
-    """
-    # Remove BOM and normalize newlines
-    s = (sql_text or "").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
-
-    # Strip common full-line comments
-    lines = []
-    for line in s.split("\n"):
-        stripped = line.strip()
-        if stripped.startswith("--") or stripped.startswith("#"):
-            continue
-        lines.append(line)
-    s = "\n".join(lines)
-
-    # Split on semicolons (basic)
-    parts = [p.strip() for p in s.split(";")]
-    stmts = []
-    for p in parts:
-        if p.strip():
-            stmts.append(p.strip() + ";")
-    return stmts
-
-def import_sql_file_mysql(
+def import_sql_text(
     host: str,
     port: int,
-    user: str,
-    password: str,
+    admin_user: str,
+    admin_pass: str,
     db_name: str,
-    sql_text: str
+    sql_text: str,
 ) -> Tuple[int, int]:
     """
-    Import .sql into db_name.
-
-    1) Try mysql-connector multi=True (fast, if supported)
-    2) If 'multi' not supported, fallback to basic statement-by-statement
-
-    Returns (ok_statements, failed_statements)
+    Import SQL into db_name, statement by statement.
+    Returns (ok_count, fail_count).
     """
-    conn = mysql.connector.connect(
-        host=host, port=port, user=user, password=password, database=db_name, autocommit=False
-    )
-    cur = conn.cursor()
+    if has_delimiter(sql_text):
+        raise RuntimeError(
+            "This .sql uses DELIMITER (procedures/triggers). "
+            "For now, import those via MySQL Shell/CLI. "
+            "Use a plain .sql dump without DELIMITER, or remove procedures."
+        )
 
+    statements = split_sql_statements(sql_text)
+    if not statements:
+        return (0, 0)
+
+    conn = mysql_admin_connect(host, port, admin_user, admin_pass, database=db_name)
+    cur = conn.cursor()
     ok = 0
     fail = 0
 
     try:
-        # ---- Fast path: multi=True (if supported by this cursor build)
-        try:
-            for _ in cur.execute(sql_text, multi=True):  # type: ignore
-                ok += 1
-            conn.commit()
-            return ok, fail
-        except TypeError as te:
-            # e.g., "unexpected keyword argument 'multi'"
-            conn.rollback()
-            # Fall back to basic splitting
-            stmts = _split_sql_statements_basic(sql_text)
-            for stmt in stmts:
-                try:
-                    cur.execute(stmt)
-                    ok += 1
-                except MySQLError:
-                    fail += 1
-                    # keep going; you can also choose to stop on first error
-            conn.commit()
-            return ok, fail
+        for stmt in statements:
+            st_clean = stmt.strip()
+            if not st_clean:
+                continue
 
-    except MySQLError:
+            # Some dumps include USE db; ignore since we already select DB
+            if re.match(r"(?i)^\s*use\s+", st_clean):
+                continue
+
+            cur.execute(st_clean)
+            ok += 1
+
+        conn.commit()
+    except MySQLError as e:
         conn.rollback()
-        raise
+        fail += 1
+        raise e
     finally:
         cur.close()
         conn.close()
 
+    return ok, fail
 
-# ============================
+# ============================================================
 # Streamlit UI
-# ============================
+# ============================================================
 
 st.set_page_config(page_title="NL → SQL (MySQL) Agent", layout="wide")
 st.title("Natural Language → SQL Agent (MySQL) — Upload DB + Query + DataFrame")
 
-
-# --- Load defaults (Railway + local)
-default_openai_key = env_get("OPENAI_API_KEY", default="")
-default_openai_model = env_get("OPENAI_MODEL", default="gpt-4o-mini")
-
-default_mysql_host = env_get("MYSQL_HOST", default="127.0.0.1")
-default_mysql_port = to_int(env_get("MYSQL_PORT", default="3306"), 3306)
-
-# Support both styles:
-default_root_user = env_get("MYSQL_ROOT_USER", "MYSQL_USER", "MYSQL_USERNAME", default="root")
-default_root_pass = env_get("MYSQL_ROOT_PASSWORD", "MYSQL_PASSWORD", default="")
-
-default_db_name = env_get("MYSQL_DEFAULT_DB", "MYSQL_DB", "MYSQL_DATABASE", default="Chinook")
-
-default_nlq_user = env_get("NLQ_USER", default="nlq_user")
-default_nlq_pass = env_get("NLQ_PASSWORD", default="NLQpass123!")
-
-
+# ---- Sidebar inputs (supports Railway variable names you showed)
 with st.sidebar:
     st.header("OpenAI")
-    api_key = st.text_input("OPENAI_API_KEY", type="password", value=default_openai_key)
-    model = st.text_input("Model", value=default_openai_model)
+    api_key = st.text_input("OPENAI_API_KEY", type="password", value=safe_env("OPENAI_API_KEY", ""))
+    model = st.text_input("OPENAI_MODEL", value=safe_env("OPENAI_MODEL", "gpt-4o-mini"))
 
     st.divider()
-    st.header("MySQL (Admin / Root) — used for import + grants")
-    mysql_host = st.text_input("Host", value=default_mysql_host)
-    mysql_port_str = st.text_input("Port", value=str(default_mysql_port))
-    mysql_port = to_int(mysql_port_str, default_mysql_port)
+    st.header("MySQL Admin (root) Connection")
 
-    root_user = st.text_input("Root/Admin User", value=default_root_user)
-    root_pass = st.text_input("Root/Admin Password", type="password", value=default_root_pass)
+    mysql_host = st.text_input("MYSQL_HOST", value=safe_env("MYSQL_HOST", "127.0.0.1"))
+    mysql_port_raw = st.text_input("MYSQL_PORT", value=safe_env("MYSQL_PORT", "3306"))
+    mysql_port = parse_port(mysql_port_raw, default=3306)
+    st.caption(f"Using port: {mysql_port}")
+
+    mysql_root_user = st.text_input("MYSQL_ROOT_USER", value=safe_env("MYSQL_ROOT_USER", "root"))
+    mysql_root_pass = st.text_input("MYSQL_ROOT_PASSWORD", type="password", value=safe_env("MYSQL_ROOT_PASSWORD", ""))
+
+    st.divider()
+    st.header("NLQ (read-only) User")
+    nlq_user = st.text_input("NLQ_USER", value=safe_env("NLQ_USER", "nlq_user"))
+    nlq_pass = st.text_input("NLQ_PASSWORD", type="password", value=safe_env("NLQ_PASSWORD", ""))
 
     st.divider()
     st.header("Database")
-    db_name = st.text_input("Database name", value=default_db_name)
-
-    st.divider()
-    st.header("Query User (Created Automatically)")
-    nlq_user = st.text_input("NLQ user", value=default_nlq_user)
-    nlq_pass = st.text_input("NLQ password", type="password", value=default_nlq_pass)
-
-    st.divider()
-    c1, c2 = st.columns(2)
-    with c1:
-        do_test_root = st.button("Test Root Conn")
-    with c2:
-        do_test_nlq = st.button("Test NLQ Conn")
+    db_name = st.text_input("MYSQL_DEFAULT_DB", value=safe_env("MYSQL_DEFAULT_DB", "Chinook"))
 
     st.divider()
     st.subheader("Upload & Import .sql")
-    st.caption("This will: Create DB → Import SQL → Create nlq_user → Grant SELECT")
     sql_upload = st.file_uploader("Upload a .sql file", type=["sql"])
-    do_import_all = st.button("Import SQL File (All Steps)")
+    import_btn = st.button("Import SQL File (Create DB → Import → Create NLQ User → Grant SELECT)", type="primary")
 
+    st.divider()
+    test_admin_btn = st.button("Test Admin (root) Connection")
+    test_nlq_btn = st.button("Test NLQ (read-only) Connection")
 
-# --- Sidebar actions
+# ---- Connection tests
+def test_mysql_connector(host: str, port: int, user: str, password: str, database: Optional[str] = None) -> None:
+    conn = mysql_admin_connect(host, port, user, password, database=database)
+    cur = conn.cursor()
+    cur.execute("SELECT 1;")
+    cur.fetchone()
+    cur.close()
+    conn.close()
 
-if do_test_root:
+def get_engine(user: str, password: str, host: str, port: int, db: str) -> Engine:
+    uri = build_mysql_uri(user, password, host, port, db)
+    return create_engine(uri, pool_pre_ping=True)
+
+if test_admin_btn:
     try:
-        test_connection_mysql(mysql_host, mysql_port, root_user, root_pass, None)
-        st.sidebar.success("Root/Admin connection OK ✅")
+        if not mysql_host.strip():
+            raise RuntimeError("MYSQL_HOST is empty.")
+        test_mysql_connector(mysql_host, mysql_port, mysql_root_user, mysql_root_pass, database=None)
+        st.sidebar.success("Admin connection OK ✅")
     except Exception as e:
-        st.sidebar.error(f"Root/Admin connection failed: {e}")
+        st.sidebar.error(f"Admin connection failed: {e}")
 
-if do_test_nlq:
+if test_nlq_btn:
     try:
-        test_connection_mysql(mysql_host, mysql_port, nlq_user, nlq_pass, db_name)
-        st.sidebar.success("NLQ user connection OK ✅")
+        if not mysql_host.strip():
+            raise RuntimeError("MYSQL_HOST is empty.")
+        test_mysql_connector(mysql_host, mysql_port, nlq_user, nlq_pass, database=db_name)
+        st.sidebar.success("NLQ connection OK ✅")
     except Exception as e:
-        st.sidebar.error(f"NLQ user connection failed: {e}")
+        st.sidebar.error(f"NLQ connection failed: {e}")
 
-if do_import_all:
-    if not sql_upload:
-        st.sidebar.warning("Upload a .sql file first.")
+# ---- Import flow (one click)
+if import_btn:
+    if not mysql_host.strip():
+        st.sidebar.error("MYSQL_HOST is empty.")
+    elif not str(mysql_port).strip():
+        st.sidebar.error("MYSQL_PORT is empty.")
+    elif not mysql_root_user.strip() or not mysql_root_pass.strip():
+        st.sidebar.error("Provide MYSQL_ROOT_USER and MYSQL_ROOT_PASSWORD.")
+    elif not nlq_user.strip() or not nlq_pass.strip():
+        st.sidebar.error("Provide NLQ_USER and NLQ_PASSWORD.")
+    elif not db_name.strip():
+        st.sidebar.error("Provide MYSQL_DEFAULT_DB (database name).")
+    elif not sql_upload:
+        st.sidebar.error("Upload a .sql file first.")
     else:
         try:
             sql_text = sql_upload.getvalue().decode("utf-8", errors="replace")
 
-            # 1) Create DB
-            create_database_mysql(mysql_host, mysql_port, root_user, root_pass, db_name)
+            with st.sidebar:
+                with st.spinner("1/4 Creating database (if needed)..."):
+                    create_database_if_needed(mysql_host, mysql_port, mysql_root_user, mysql_root_pass, db_name)
 
-            # 2) Import SQL (as root/admin)
-            ok, failed = import_sql_file_mysql(mysql_host, mysql_port, root_user, root_pass, db_name, sql_text)
+                with st.spinner("2/4 Importing SQL into database..."):
+                    ok, _ = import_sql_text(mysql_host, mysql_port, mysql_root_user, mysql_root_pass, db_name, sql_text)
 
-            # 3) Create nlq user + grant SELECT
-            ensure_nlq_user_and_grants(
-                host=mysql_host,
-                port=mysql_port,
-                root_user=root_user,
-                root_password=root_pass,
-                db_name=db_name,
-                nlq_user=nlq_user,
-                nlq_password=nlq_pass,
-            )
+                with st.spinner("3/4 Creating NLQ user + granting SELECT..."):
+                    ensure_nlq_user_and_grants(
+                        mysql_host, mysql_port, mysql_root_user, mysql_root_pass, nlq_user, nlq_pass, db_name
+                    )
 
-            st.sidebar.success(f"Import completed ✅  OK statements: {ok} | Failed: {failed}")
-            if failed > 0:
-                st.sidebar.warning(
-                    "Some statements failed. If your SQL file contains procedures/triggers/DELIMITER, "
-                    "import using MySQL Shell/CLI SOURCE instead."
-                )
+                with st.spinner("4/4 Testing NLQ user connection..."):
+                    test_mysql_connector(mysql_host, mysql_port, nlq_user, nlq_pass, database=db_name)
 
+                st.success(f"Import complete ✅  Statements executed: {ok}.  NLQ user ready on `{db_name}`.")
         except Exception as e:
-            st.sidebar.error(f"Import failed ❌ {e}")
+            st.sidebar.error(f"Import failed ❌\n{e}")
             st.sidebar.info(
-                "Tip: If the .sql uses DELIMITER/procedures/triggers, import using MySQL Shell SOURCE instead."
+                "Tip: If your SQL has `DELIMITER` / procedures / triggers, this app blocks it.\n"
+                "Use MySQL Shell/CLI to import that kind of script, or export a plain schema+data dump."
             )
 
-
-# ============================
-# Main: Ask question → SQL → DataFrame
-# ============================
+# ============================================================
+# Main: Ask question -> Generate SQL -> Run -> DataFrame
+# ============================================================
 
 st.subheader("Ask a question")
 question = st.text_area(
-    "Example: Which country's customers spent the most by invoice?",
+    "Example: Top 10 most rented films / Which country's customers spent the most by invoice?",
     height=90,
 )
-
 run_btn = st.button("Run Query")
-
 
 if run_btn:
     if not api_key.strip():
-        st.error("Please enter your OPENAI_API_KEY in the sidebar.")
+        st.error("Please enter OPENAI_API_KEY in the sidebar.")
         st.stop()
 
-    if not question.strip():
-        st.error("Please type a question.")
+    if not mysql_host.strip():
+        st.error("MYSQL_HOST is empty.")
         st.stop()
 
-    # Connect using the NLQ user (SELECT-only)
+    if not db_name.strip():
+        st.error("MYSQL_DEFAULT_DB (database name) is empty.")
+        st.stop()
+
+    # Use NLQ user for querying (safer)
     try:
-        engine = build_engine(nlq_user, nlq_pass, mysql_host, mysql_port, db_name)
+        engine = get_engine(nlq_user, nlq_pass, mysql_host, mysql_port, db_name)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
     except Exception as e:
-        st.error(f"Database connection failed (NLQ user): {e}")
-        st.info("Make sure you imported the DB using the 'Import SQL File (All Steps)' button.")
+        st.error(
+            "NLQ user connection failed. Make sure you imported DB and granted privileges.\n\n"
+            f"Error: {e}"
+        )
         st.stop()
 
     llm = get_llm(api_key=api_key, model=model, temperature=0.0)
