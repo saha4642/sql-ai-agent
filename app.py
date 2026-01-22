@@ -15,12 +15,9 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from langchain_openai import ChatOpenAI
 
+
 # ============================================================
 # 0) Railway-safe MySQL connection utilities
-#    - Prefer MYSQL_PUBLIC_URL (non-root)
-#    - Fall back to MYSQL_USER/PASSWORD/HOST/PORT/DB (non-root)
-#    - Never allow root from the app
-#    - Encode creds + force mysql+mysqlconnector dialect
 # ============================================================
 
 def env_any(*names: str) -> str:
@@ -33,12 +30,11 @@ def env_any(*names: str) -> str:
 
 def normalize_mysql_sqlalchemy_url(raw: str) -> str:
     """
-    Convert Railway/standard MySQL URLs into a valid SQLAlchemy URL:
+    Convert MySQL URLs into valid SQLAlchemy URLs:
       - mysql:// -> mysql+mysqlconnector://
       - mysql+mysqldb:// -> mysql+mysqlconnector://
       - strip quotes
       - URL-encode username/password
-      - validate via SQLAlchemy make_url
     """
     if not raw:
         raise ValueError("Database URL is empty/None. Check Railway environment variables.")
@@ -52,7 +48,6 @@ def normalize_mysql_sqlalchemy_url(raw: str) -> str:
 
     u = make_url(s)
 
-    # Encode credentials to handle special chars
     username = quote_plus(u.username) if u.username else None
     password = quote_plus(u.password) if u.password else None
     u = u.set(username=username, password=password)
@@ -60,9 +55,20 @@ def normalize_mysql_sqlalchemy_url(raw: str) -> str:
     return str(u)
 
 
+def assert_not_root(sqlalchemy_url: str, label: str = "DB URL") -> None:
+    u = make_url(sqlalchemy_url)
+    if (u.username or "").lower() == "root":
+        raise ValueError(
+            f"{label} is using user 'root'. Railway blocks root for app connections.\n"
+            "Use MYSQL_USER/MYSQL_PASSWORD/MYSQL_HOST/MYSQL_PORT/MYSQL_DATABASE variables."
+        )
+
+
 def build_url_from_discrete_vars() -> str:
     """
-    Supports both Railway naming styles:
+    Prefer discrete vars, which typically represent the correct non-root app user.
+
+    Supports both naming styles:
       - MYSQL_USER, MYSQL_PASSWORD, MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE / MYSQL_DB / MYSQL_DEFAULT_DB
       - MYSQLUSER, MYSQLPASSWORD, MYSQLHOST, MYSQLPORT, MYSQLDATABASE
     """
@@ -70,44 +76,29 @@ def build_url_from_discrete_vars() -> str:
     pw = env_any("MYSQL_PASSWORD", "MYSQLPASSWORD")
     host = env_any("MYSQL_HOST", "MYSQLHOST")
     port = env_any("MYSQL_PORT", "MYSQLPORT")
-    db = env_any(
-        "MYSQL_DATABASE", "MYSQLDATABASE",
-        "MYSQL_DB", "MYSQL_DEFAULT_DB"
-    )
+    db = env_any("MYSQL_DATABASE", "MYSQLDATABASE", "MYSQL_DB", "MYSQL_DEFAULT_DB")
 
     if all([user, pw, host, port, db]):
+        # Normalize later (adds mysql+mysqlconnector and encodes creds)
         return f"mysql://{user}:{pw}@{host}:{port}/{db}"
     return ""
 
 
 def pick_best_mysql_url() -> str:
     """
-    Railway best practice for apps:
-      1) MYSQL_PUBLIC_URL (preferred, non-root)
-      2) MYSQL_PUBLIC_URL (if user uses variant naming)
-      3) Discrete vars MYSQL_USER/PASSWORD/HOST/PORT/DB
-      4) MYSQL_URL (often root) -> will be blocked if root
+    IMPORTANT: Your MYSQL_PUBLIC_URL is root-based (per your screenshot),
+    so prefer discrete vars first.
     """
     return (
-        env_any("MYSQL_PUBLIC_URL", "MYSQL_PUBLIC_URL")
-        or build_url_from_discrete_vars()
+        build_url_from_discrete_vars()
+        or env_any("MYSQL_PUBLIC_URL")
         or env_any("MYSQL_URL")
         or ""
     )
 
 
-def assert_not_root(sqlalchemy_url: str, label: str = "DB URL") -> None:
-    u = make_url(sqlalchemy_url)
-    if (u.username or "").lower() == "root":
-        raise ValueError(
-            f"{label} is using user 'root'. Railway blocks root for app connections.\n"
-            "Use MYSQL_PUBLIC_URL (recommended) or MYSQL_USER/MYSQL_PASSWORD variables."
-        )
-
-
 @st.cache_resource(show_spinner=False)
 def get_engine(sqlalchemy_url: str) -> Engine:
-    # Cache is keyed by sqlalchemy_url string; changing it creates a new engine.
     return create_engine(sqlalchemy_url, pool_pre_ping=True, pool_recycle=1800)
 
 
@@ -217,24 +208,21 @@ with st.sidebar:
     st.divider()
     st.header("MySQL (Railway)")
     st.caption(
-        "This app automatically uses Railway's MYSQL_PUBLIC_URL (non-root). "
-        "If missing, it uses MYSQL_USER/MYSQL_PASSWORD/etc. Root is blocked."
+        "This app uses MYSQL_USER/MYSQL_PASSWORD/MYSQL_HOST/MYSQL_PORT/MYSQL_DATABASE first. "
+        "Your MYSQL_PUBLIC_URL is root-based, so it is NOT preferred."
     )
 
-    col1, col2 = st.columns(2)
-    if col1.button("Clear DB Cache"):
+    c1, c2 = st.columns(2)
+    if c1.button("Clear DB Cache"):
         st.cache_resource.clear()
         st.rerun()
-    btn_test = col2.button("Test Connection")
+    btn_test = c2.button("Test Connection")
 
-# Pick URL from env only (no manual input -> prevents pasting root)
 raw_url = pick_best_mysql_url()
 if not raw_url:
     st.error(
-        "No MySQL connection info found.\n\n"
-        "In Railway, add variable references from your MySQL service into this app service:\n"
-        "- MYSQL_PUBLIC_URL (recommended)\n"
-        "or\n"
+        "No MySQL connection info found in this service.\n\n"
+        "In Railway (Streamlit service → Variables), ensure you have references for:\n"
         "- MYSQL_USER, MYSQL_PASSWORD, MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE\n"
     )
     st.stop()
@@ -247,7 +235,7 @@ except Exception as e:
     st.stop()
 
 parsed = make_url(sqlalchemy_url)
-db_name = parsed.database or env_any("MYSQLDATABASE", "MYSQL_DATABASE", "MYSQL_DB", "MYSQL_DEFAULT_DB") or "railway"
+db_name = parsed.database or env_any("MYSQL_DATABASE", "MYSQLDATABASE", "MYSQL_DB", "MYSQL_DEFAULT_DB") or "railway"
 
 engine = get_engine(sqlalchemy_url)
 
@@ -256,9 +244,9 @@ with st.sidebar.expander("DB Debug (safe)", expanded=False):
     st.write("Host:", parsed.host)
     st.write("Port:", parsed.port)
     st.write("Database:", db_name)
-    st.write("MYSQL_PUBLIC_URL set:", bool(env_any("MYSQL_PUBLIC_URL", "MYSQL_PUBLIC_URL")))
-    st.write("MYSQL_URL set:", bool(env_any("MYSQL_URL")))
-    st.write("Discrete vars set:", bool(build_url_from_discrete_vars()))
+    st.write("Discrete URL built:", bool(build_url_from_discrete_vars()))
+    st.write("MYSQL_PUBLIC_URL exists:", bool(env_any("MYSQL_PUBLIC_URL")))
+    st.write("MYSQL_URL exists:", bool(env_any("MYSQL_URL")))
 
 if btn_test:
     ok, msg = test_engine(engine)
