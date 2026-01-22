@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Tuple
+from urllib.parse import quote_plus
 
 import pandas as pd
 import streamlit as st
@@ -16,36 +16,53 @@ from sqlalchemy.exc import SQLAlchemyError
 from langchain_openai import ChatOpenAI
 
 # ============================================================
-# 0) Critical Fix: Force SQLAlchemy to NOT use MySQLdb
+# 0) Critical Fixes:
+#    - Force SQLAlchemy to use mysql-connector-python (not MySQLdb)
+#    - Robustly parse/normalize Railway URLs
+#    - URL-encode username/password to avoid parse errors
 # ============================================================
 
-def normalize_mysql_url(url: str) -> str:
+def normalize_mysql_sqlalchemy_url(raw: str) -> str:
     """
-    Railway usually provides: mysql://user:pass@host:port/db
-    If we pass that to SQLAlchemy, it often tries MySQLdb (mysqlclient) -> ModuleNotFoundError: MySQLdb
-    Fix: force mysql+mysqlconnector:// (uses mysql-connector-python).
+    Accepts common Railway/managed-MySQL URLs and returns a valid SQLAlchemy URL.
+
+    Fixes:
+      - mysql://... -> mysql+mysqlconnector://...
+      - mysql+mysqldb://... -> mysql+mysqlconnector://...
+      - strips accidental quotes/spaces
+      - URL-encodes username/password (handles @ : / ? # etc.)
+      - validates via SQLAlchemy make_url()
+
+    Raises:
+      ValueError if empty/None.
+      sqlalchemy.exc.ArgumentError if the URL is structurally invalid.
     """
-    u = (url or "").strip()
-    if not u:
-        return ""
+    if not raw:
+        raise ValueError("Database URL is empty/None. Check Railway environment variables.")
 
-    if u.startswith("mysql+mysqlconnector://"):
-        return u
+    s = raw.strip().strip('"').strip("'")
 
-    if u.startswith("mysql+mysqldb://"):
-        return "mysql+mysqlconnector://" + u[len("mysql+mysqldb://") :]
+    # Force mysql-connector driver
+    if s.startswith("mysql://"):
+        s = s.replace("mysql://", "mysql+mysqlconnector://", 1)
+    elif s.startswith("mysql+mysqldb://"):
+        s = s.replace("mysql+mysqldb://", "mysql+mysqlconnector://", 1)
 
-    if u.startswith("mysql://"):
-        return "mysql+mysqlconnector://" + u[len("mysql://") :]
+    # Parse using SQLAlchemy
+    u = make_url(s)
 
-    # If already explicit driver (e.g., mysql+pymysql://), leave it
-    return u
+    # Encode creds to avoid URL parsing problems when they contain special chars
+    username = quote_plus(u.username) if u.username else None
+    password = quote_plus(u.password) if u.password else None
+    u = u.set(username=username, password=password)
+
+    return str(u)
 
 
 @st.cache_resource(show_spinner=False)
 def get_engine(url: str) -> Engine:
-    url = normalize_mysql_url(url)
-    return create_engine(url, pool_pre_ping=True, pool_recycle=1800)
+    safe_url = normalize_mysql_sqlalchemy_url(url)
+    return create_engine(safe_url, pool_pre_ping=True, pool_recycle=1800)
 
 
 def test_engine(engine: Engine) -> Tuple[bool, str]:
@@ -167,21 +184,18 @@ def provision_nlq_user(engine_admin: Engine, db_name: str, nlq_user: str, nlq_pa
     """
     Creates nlq_user@'%' and grants SELECT on db.*.
     NOTE: Some managed MySQL providers do NOT allow CREATE USER/GRANT from the app.
-    In that case this will fail with 1045/1142 etc — then just use MYSQL_URL for querying.
     """
     if not NLQ_USER_RE.match(nlq_user or ""):
         raise ValueError("NLQ_USER must be alphanumeric/underscore (max 32 chars).")
     if not nlq_password:
         raise ValueError("NLQ_PASSWORD is empty.")
 
-    # Identifiers can't be parameterized safely; validate + format.
     create_user_sql = f"CREATE USER IF NOT EXISTS `{nlq_user}`@'%' IDENTIFIED BY :pw;"
     alter_user_sql = f"ALTER USER `{nlq_user}`@'%' IDENTIFIED BY :pw;"
     grant_sql = f"GRANT SELECT ON `{db_name}`.* TO `{nlq_user}`@'%';"
 
     with engine_admin.connect() as conn:
         conn.execute(text(create_user_sql), {"pw": nlq_password})
-        # Ensure password is set even if user already existed
         conn.execute(text(alter_user_sql), {"pw": nlq_password})
         conn.execute(text(grant_sql))
         conn.execute(text("FLUSH PRIVILEGES;"))
@@ -210,10 +224,9 @@ with st.sidebar:
 
     st.divider()
     st.header("MySQL URLs")
-    st.caption("Use Railway’s MYSQL_URL. This app converts mysql:// → mysql+mysqlconnector:// automatically.")
+    st.caption("Use Railway’s MYSQL_URL. This app converts mysql:// → mysql+mysqlconnector:// and safely encodes creds.")
 
     admin_url_input = st.text_input("MYSQL_URL (admin/app)", value=ENV_MYSQL_URL)
-    # Optional separate read-only URL (if you created one)
     nlq_url_input = st.text_input("DATABASE_URL (read-only, optional)", value=ENV_DATABASE_URL)
 
     st.divider()
@@ -227,9 +240,14 @@ with st.sidebar:
     btn_grant = cols[1].button("Create/Grant NLQ")
 
 # --- Validate admin URL
-admin_url = normalize_mysql_url(admin_url_input)
-if not admin_url:
+if not (admin_url_input or "").strip():
     st.error("MYSQL_URL is missing. Set it in Railway variables or paste it in the sidebar.")
+    st.stop()
+
+try:
+    admin_url = normalize_mysql_sqlalchemy_url(admin_url_input)
+except Exception:
+    st.error("Could not parse MYSQL_URL. Make sure it looks like mysql://user:pass@host:port/db")
     st.stop()
 
 # Parse admin URL to get DB name (for schema + grants)
@@ -237,7 +255,7 @@ try:
     admin_parsed = make_url(admin_url)
     db_name = admin_parsed.database or (os.getenv("MYSQL_DATABASE") or "railway")
 except Exception:
-    st.error("Could not parse MYSQL_URL. Make sure it looks like mysql://user:pass@host:port/db")
+    st.error("Could not parse MYSQL_URL after normalization. Check the value in Railway variables.")
     st.stop()
 
 engine_admin = get_engine(admin_url)
@@ -247,23 +265,33 @@ engine_admin = get_engine(admin_url)
 # 1) If DATABASE_URL provided (read-only url) -> use it
 # 2) If "use NLQ user" checked -> build URL from admin host/port/db + NLQ creds
 # 3) Else use admin/app MYSQL_URL directly
-query_url = ""
-if nlq_url_input.strip():
-    query_url = normalize_mysql_url(nlq_url_input.strip())
-elif use_nlq_user and nlq_user.strip() and nlq_password.strip():
-    # Build derived NLQ URL from admin host/port/db
+query_url_raw = ""
+if (nlq_url_input or "").strip():
+    query_url_raw = nlq_url_input.strip()
+elif use_nlq_user and (nlq_user or "").strip() and (nlq_password or "").strip():
     host = admin_parsed.host
     port = admin_parsed.port or 3306
-    query_url = f"mysql+mysqlconnector://{nlq_user}:{nlq_password}@{host}:{port}/{db_name}"
-else:
-    query_url = admin_url
 
-engine_query = get_engine(query_url)
+    # Important: encode user/pass before building URL string
+    u_enc = quote_plus(nlq_user.strip())
+    p_enc = quote_plus(nlq_password.strip())
+
+    query_url_raw = f"mysql+mysqlconnector://{u_enc}:{p_enc}@{host}:{port}/{db_name}"
+else:
+    query_url_raw = admin_url
+
+try:
+    query_url = normalize_mysql_sqlalchemy_url(query_url_raw)
+    engine_query = get_engine(query_url)
+except Exception as e:
+    st.error(f"Invalid query DB URL: {e}")
+    st.stop()
 
 # --- Actions
 if btn_test:
     okA, msgA = test_engine(engine_admin)
     okQ, msgQ = test_engine(engine_query)
+
     if okA:
         st.sidebar.success("Admin/app connection OK ✅")
     else:
