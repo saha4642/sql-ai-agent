@@ -16,8 +16,20 @@ from sqlalchemy.exc import SQLAlchemyError
 from langchain_openai import ChatOpenAI
 
 # ============================================================
-# 0) Connection helpers (Railway MySQL safe)
+# 0) Railway-safe MySQL connection utilities
+#    - Prefer MYSQL_PUBLIC_URL (non-root)
+#    - Fall back to MYSQL_USER/PASSWORD/HOST/PORT/DB (non-root)
+#    - Never allow root from the app
+#    - Encode creds + force mysql+mysqlconnector dialect
 # ============================================================
+
+def env_any(*names: str) -> str:
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return str(v)
+    return ""
+
 
 def normalize_mysql_sqlalchemy_url(raw: str) -> str:
     """
@@ -31,7 +43,7 @@ def normalize_mysql_sqlalchemy_url(raw: str) -> str:
     if not raw:
         raise ValueError("Database URL is empty/None. Check Railway environment variables.")
 
-    s = raw.strip().strip('"').strip("'")
+    s = str(raw).strip().strip('"').strip("'")
 
     if s.startswith("mysql://"):
         s = s.replace("mysql://", "mysql+mysqlconnector://", 1)
@@ -50,54 +62,52 @@ def normalize_mysql_sqlalchemy_url(raw: str) -> str:
 
 def build_url_from_discrete_vars() -> str:
     """
-    Railway exposes MYSQLUSER/MYSQLPASSWORD/MYSQLHOST/MYSQLPORT/MYSQLDATABASE.
-    Use them as a fallback when MYSQL_PUBLIC_URL isn't used.
+    Supports both Railway naming styles:
+      - MYSQL_USER, MYSQL_PASSWORD, MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE / MYSQL_DB / MYSQL_DEFAULT_DB
+      - MYSQLUSER, MYSQLPASSWORD, MYSQLHOST, MYSQLPORT, MYSQLDATABASE
     """
-    user = os.getenv("MYSQLUSER", "")
-    pw = os.getenv("MYSQLPASSWORD", "")
-    host = os.getenv("MYSQLHOST", "")
-    port = os.getenv("MYSQLPORT", "")
-    db = os.getenv("MYSQLDATABASE", "") or os.getenv("MYSQL_DATABASE", "")
+    user = env_any("MYSQL_USER", "MYSQLUSER")
+    pw = env_any("MYSQL_PASSWORD", "MYSQLPASSWORD")
+    host = env_any("MYSQL_HOST", "MYSQLHOST")
+    port = env_any("MYSQL_PORT", "MYSQLPORT")
+    db = env_any(
+        "MYSQL_DATABASE", "MYSQLDATABASE",
+        "MYSQL_DB", "MYSQL_DEFAULT_DB"
+    )
 
     if all([user, pw, host, port, db]):
-        # NOTE: we'll normalize+encode later
         return f"mysql://{user}:{pw}@{host}:{port}/{db}"
     return ""
 
 
-def pick_best_admin_url() -> str:
+def pick_best_mysql_url() -> str:
     """
-    Railway best practice:
-      1) MYSQL_PUBLIC_URL (non-root, app-safe)
-      2) discrete vars (MYSQLUSER/MYSQLPASSWORD/...)
-      3) MYSQL_URL (often root; we will block root explicitly)
+    Railway best practice for apps:
+      1) MYSQL_PUBLIC_URL (preferred, non-root)
+      2) MYSQL_PUBLIC_URL (if user uses variant naming)
+      3) Discrete vars MYSQL_USER/PASSWORD/HOST/PORT/DB
+      4) MYSQL_URL (often root) -> will be blocked if root
     """
     return (
-        os.getenv("MYSQL_PUBLIC_URL", "")
+        env_any("MYSQL_PUBLIC_URL", "MYSQL_PUBLIC_URL")
         or build_url_from_discrete_vars()
-        or os.getenv("MYSQL_URL", "")
+        or env_any("MYSQL_URL")
         or ""
     )
 
 
-def assert_not_root(url: str, label: str = "DB URL") -> None:
-    """
-    Railway commonly restricts root from remote/app connections.
-    If user is root, fail early with a helpful message.
-    """
-    u = make_url(url)
+def assert_not_root(sqlalchemy_url: str, label: str = "DB URL") -> None:
+    u = make_url(sqlalchemy_url)
     if (u.username or "").lower() == "root":
         raise ValueError(
             f"{label} is using user 'root'. Railway blocks root for app connections.\n"
-            f"Use MYSQL_PUBLIC_URL (recommended) or MYSQLUSER/MYSQLPASSWORD variables."
+            "Use MYSQL_PUBLIC_URL (recommended) or MYSQL_USER/MYSQL_PASSWORD variables."
         )
 
 
 @st.cache_resource(show_spinner=False)
 def get_engine(sqlalchemy_url: str) -> Engine:
-    """
-    Cache is keyed by the URL string, so changing URL makes a new engine.
-    """
+    # Cache is keyed by sqlalchemy_url string; changing it creates a new engine.
     return create_engine(sqlalchemy_url, pool_pre_ping=True, pool_recycle=1800)
 
 
@@ -155,6 +165,7 @@ def fetch_schema_summary(engine: Engine, db: str, max_tables: int = 200) -> str:
         ORDER BY TABLE_NAME, ORDINAL_POSITION
     """)
     df = pd.read_sql(q, engine, params={"db": db})
+
     lines = []
     for tname, g in df.groupby("TABLE_NAME"):
         cols = ", ".join(f"{r.COLUMN_NAME}({r.DATA_TYPE})" for r in g.itertuples(index=False))
@@ -174,10 +185,12 @@ def generate_sql_from_question(llm: ChatOpenAI, schema: str, question: str) -> s
         "- If ambiguous, make a reasonable assumption.\n"
     )
     user = f"SCHEMA:\n{schema}\n\nQUESTION:\n{question}\n\nReturn ONLY SQL."
+
     raw = llm.invoke(
         [{"role": "system", "content": system},
          {"role": "user", "content": user}]
     ).content
+
     sql = extract_sql(raw)
     sql = normalize_sql(sql)
     sql = ensure_limit(sql, default_limit=200)
@@ -195,7 +208,6 @@ st.set_page_config(page_title="NL → SQL (MySQL) Agent", layout="wide")
 st.title("Natural Language → SQL Agent (MySQL) — DataFrame Results")
 
 ENV_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-DEFAULT_ADMIN_RAW = pick_best_admin_url()
 
 with st.sidebar:
     st.header("OpenAI")
@@ -203,73 +215,63 @@ with st.sidebar:
     openai_model = st.text_input("OPENAI_MODEL", value=ENV_OPENAI_MODEL)
 
     st.divider()
-    st.header("MySQL Connection (Railway)")
+    st.header("MySQL (Railway)")
     st.caption(
-        "✅ Use MYSQL_PUBLIC_URL (recommended). "
-        "🚫 Do NOT use MYSQL_URL if it connects as root."
+        "This app automatically uses Railway's MYSQL_PUBLIC_URL (non-root). "
+        "If missing, it uses MYSQL_USER/MYSQL_PASSWORD/etc. Root is blocked."
     )
 
-    admin_raw = st.text_input("MYSQL_PUBLIC_URL (or app-safe URL)", value=DEFAULT_ADMIN_RAW)
-
-    colA, colB = st.columns(2)
-    btn_clear_cache = colA.button("Clear DB Cache")
-    btn_test = colB.button("Test Connections")
-
-    if btn_clear_cache:
+    col1, col2 = st.columns(2)
+    if col1.button("Clear DB Cache"):
         st.cache_resource.clear()
         st.rerun()
+    btn_test = col2.button("Test Connection")
 
-# --- Validate + normalize admin URL
-if not (admin_raw or "").strip():
-    st.error("Missing DB URL. In Railway, copy MYSQL_PUBLIC_URL and paste it here.")
+# Pick URL from env only (no manual input -> prevents pasting root)
+raw_url = pick_best_mysql_url()
+if not raw_url:
+    st.error(
+        "No MySQL connection info found.\n\n"
+        "In Railway, add variable references from your MySQL service into this app service:\n"
+        "- MYSQL_PUBLIC_URL (recommended)\n"
+        "or\n"
+        "- MYSQL_USER, MYSQL_PASSWORD, MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE\n"
+    )
     st.stop()
 
 try:
-    admin_url = normalize_mysql_sqlalchemy_url(admin_raw)
-    assert_not_root(admin_url, label="Admin/app URL")
+    sqlalchemy_url = normalize_mysql_sqlalchemy_url(raw_url)
+    assert_not_root(sqlalchemy_url, label="Admin/app URL")
 except Exception as e:
     st.error(str(e))
     st.stop()
 
-admin_parsed = make_url(admin_url)
-db_name = admin_parsed.database or os.getenv("MYSQLDATABASE") or os.getenv("MYSQL_DATABASE") or "railway"
+parsed = make_url(sqlalchemy_url)
+db_name = parsed.database or env_any("MYSQLDATABASE", "MYSQL_DATABASE", "MYSQL_DB", "MYSQL_DEFAULT_DB") or "railway"
 
-# For this app, admin/query engines can be the same (read-only safety is enforced in SQL)
-engine_admin = get_engine(admin_url)
-engine_query = get_engine(admin_url)
+engine = get_engine(sqlalchemy_url)
 
-# Safe debug info (no passwords)
 with st.sidebar.expander("DB Debug (safe)", expanded=False):
-    st.write("Using user:", admin_parsed.username)
-    st.write("Host:", admin_parsed.host)
-    st.write("Port:", admin_parsed.port)
+    st.write("Using user:", parsed.username)
+    st.write("Host:", parsed.host)
+    st.write("Port:", parsed.port)
     st.write("Database:", db_name)
-    st.write("MYSQL_PUBLIC_URL set:", bool(os.getenv("MYSQL_PUBLIC_URL")))
-    st.write("MYSQL_URL set:", bool(os.getenv("MYSQL_URL")))
-    st.write("MYSQLUSER set:", bool(os.getenv("MYSQLUSER")))
+    st.write("MYSQL_PUBLIC_URL set:", bool(env_any("MYSQL_PUBLIC_URL", "MYSQL_PUBLIC_URL")))
+    st.write("MYSQL_URL set:", bool(env_any("MYSQL_URL")))
+    st.write("Discrete vars set:", bool(build_url_from_discrete_vars()))
 
 if btn_test:
-    okA, msgA = test_engine(engine_admin)
-    okQ, msgQ = test_engine(engine_query)
-    if okA:
-        st.sidebar.success("Admin/app connection OK ✅")
+    ok, msg = test_engine(engine)
+    if ok:
+        st.sidebar.success("Connection OK ✅")
     else:
-        st.sidebar.error(f"Admin/app connection failed: {msgA}")
-    if okQ:
-        st.sidebar.success("Query connection OK ✅")
-    else:
-        st.sidebar.error(f"Query connection failed: {msgQ}")
+        st.sidebar.error(f"Connection failed: {msg}")
 
 with st.expander("Connection status", expanded=True):
-    okA, msgA = test_engine(engine_admin)
-    st.write(f"**Admin/app engine:** {'✅ OK' if okA else '❌ FAIL'}")
-    if not okA:
-        st.code(msgA)
-
-    okQ, msgQ = test_engine(engine_query)
-    st.write(f"**Query engine:** {'✅ OK' if okQ else '❌ FAIL'}")
-    if not okQ:
-        st.code(msgQ)
+    ok, msg = test_engine(engine)
+    st.write(f"**Engine:** {'✅ OK' if ok else '❌ FAIL'}")
+    if not ok:
+        st.code(msg)
 
 # ============================================================
 # 3) Main: Ask question -> SQL -> DataFrame
@@ -288,16 +290,16 @@ if run_btn:
         st.error("Missing OPENAI_API_KEY. Set it in Railway variables or enter it in the sidebar.")
         st.stop()
 
-    okQ, msgQ = test_engine(engine_query)
-    if not okQ:
-        st.error(f"Database connection failed: {msgQ}")
+    ok, msg = test_engine(engine)
+    if not ok:
+        st.error(f"Database connection failed: {msg}")
         st.stop()
 
     llm = get_llm(api_key=openai_key, model=openai_model, temperature=0.0)
 
     with st.spinner("Reading schema..."):
         try:
-            schema = fetch_schema_summary(engine_query, db=db_name)
+            schema = fetch_schema_summary(engine, db=db_name)
         except SQLAlchemyError as e:
             st.error(f"Failed to read schema for `{db_name}`: {e}")
             st.stop()
@@ -314,7 +316,7 @@ if run_btn:
 
     with st.spinner("Running query..."):
         try:
-            df = run_sql_to_df(engine_query, sql)
+            df = run_sql_to_df(engine, sql)
         except Exception as e:
             st.error(f"SQL execution failed: {e}")
             st.stop()
