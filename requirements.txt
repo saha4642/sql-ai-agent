@@ -1,21 +1,15 @@
-# App
 streamlit==1.41.1
 pandas==2.2.3
 
-# OpenAI
 openai==1.57.4
-langchain-openai==0.1.25
-
-# LangChain core
 langchain==0.2.17
 langchain-community==0.2.16
-langchain-core==0.2.41
+langchain-openai==0.1.25
+# remove langchain-core pin OR set >=0.2.43,<0.3.0
 
-# DB
 mysql-connector-python==8.4.0
 SQLAlchemy>=2.0.29
 
-# Env + utilities
 python-dotenv==1.0.1
 pydantic==2.10.3
 tenacity==8.5.0
