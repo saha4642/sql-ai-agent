@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 from typing import Optional, Tuple
-from urllib.parse import quote_plus, urlsplit, unquote
 
 import pandas as pd
 import streamlit as st
@@ -12,10 +12,9 @@ from mysql.connector import Error as MySQLError
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.engine.url import make_url
+from sqlalchemy.engine.url import make_url, URL
 
 from langchain_openai import ChatOpenAI
-
 
 # ----------------------------
 # Regex / Guards
@@ -24,81 +23,189 @@ SQL_CODEBLOCK_RE = re.compile(r"```sql\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE
 
 
 # ----------------------------
-# URL helpers (Railway-safe)
+# URL / Config helpers
 # ----------------------------
-def normalize_sqlalchemy_mysql_url(url_str: str) -> str:
-    """
-    Accepts Railway-style mysql://user:pass@host:port/db
-    Returns SQLAlchemy mysql+mysqlconnector://user:pass@host:port/db
+@dataclass
+class DbCfg:
+    drivername: str
+    username: str
+    password: str
+    host: str
+    port: int
+    database: str
 
-    Handles special characters in passwords safely.
+
+def _sanitize_db_name(name: str) -> str:
+    # allow letters, numbers, underscore only
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", (name or "").strip())
+    return cleaned or "railway"
+
+
+def to_sqlalchemy_mysqlconnector(url_str: str) -> str:
     """
-    url_str = (url_str or "").strip()
-    if not url_str:
+    Railway often gives mysql://user:pass@host:port/db
+    SQLAlchemy with mysql-connector expects mysql+mysqlconnector://...
+    """
+    if not url_str or not isinstance(url_str, str):
         raise ValueError("Empty database URL")
 
-    # If it's already a SQLAlchemy mysqlconnector URL, return it
-    if url_str.startswith("mysql+mysqlconnector://"):
-        return url_str
+    u = make_url(url_str.strip())
 
-    # Some users store raw "mysql://..."
-    if url_str.startswith("mysql://"):
-        parts = urlsplit(url_str)
-        user = unquote(parts.username or "")
-        pwd = unquote(parts.password or "")
-        host = parts.hostname or "localhost"
-        port = parts.port or 3306
-        db = (parts.path or "").lstrip("/")  # may be empty
+    # Force mysql+mysqlconnector
+    if u.drivername.startswith("mysql"):
+        drivername = "mysql+mysqlconnector"
+    else:
+        # If somehow it's not mysql, keep it (but likely wrong for this app)
+        drivername = u.drivername
 
-        # Rebuild with mysqlconnector + quoted credentials
-        user_q = quote_plus(user)
-        pwd_q = quote_plus(pwd)
-        if db:
-            return f"mysql+mysqlconnector://{user_q}:{pwd_q}@{host}:{port}/{db}"
-        return f"mysql+mysqlconnector://{user_q}:{pwd_q}@{host}:{port}"
-
-    # As a fallback, try SQLAlchemy's parser (will raise if invalid)
-    u = make_url(url_str)
-    if u.drivername == "mysql":
-        return str(u.set(drivername="mysql+mysqlconnector"))
-    return url_str
+    fixed = URL.create(
+        drivername=drivername,
+        username=u.username,
+        password=u.password,
+        host=u.host,
+        port=u.port,
+        database=u.database,
+        query=dict(u.query) if u.query else None,
+    )
+    return str(fixed)
 
 
-def url_with_db(base_url: str, db: str) -> str:
+def parse_mysql_cfg(url_str: str) -> DbCfg:
+    u = make_url(url_str.strip())
+    if not u.drivername.startswith("mysql"):
+        raise ValueError("URL is not a MySQL URL")
+    if not u.host or not u.port or not u.username:
+        raise ValueError("MySQL URL missing host/port/user")
+    return DbCfg(
+        drivername=u.drivername,
+        username=u.username or "",
+        password=u.password or "",
+        host=u.host or "",
+        port=int(u.port),
+        database=u.database or "",
+    )
+
+
+def build_admin_url_and_cfg() -> Tuple[str, DbCfg]:
     """
-    Ensure the SQLAlchemy URL includes a database.
-    If base_url has a db already, replace it.
+    Prefer DATABASE_URL_ROOT if provided.
+    Else use MYSQL_URL / DATABASE_URL.
     """
-    u = make_url(base_url)
-    return str(u.set(database=db))
+    raw = (
+        os.getenv("DATABASE_URL_ROOT", "").strip()
+        or os.getenv("MYSQL_URL", "").strip()
+        or os.getenv("DATABASE_URL", "").strip()
+    )
+    if not raw:
+        raise ValueError("Missing DATABASE_URL_ROOT / MYSQL_URL / DATABASE_URL in environment variables")
+
+    # Ensure a database exists in URL string (Railway usually uses /railway)
+    cfg = parse_mysql_cfg(raw)
+    sa_url = to_sqlalchemy_mysqlconnector(raw)
+    return sa_url, cfg
+
+
+def build_nlq_url(db_name: str) -> str:
+    """
+    Build NLQ SQLAlchemy URL using same host/port but nlq_user creds.
+    """
+    admin_raw = (
+        os.getenv("MYSQL_URL", "").strip()
+        or os.getenv("DATABASE_URL", "").strip()
+        or os.getenv("DATABASE_URL_ROOT", "").strip()
+    )
+    if not admin_raw:
+        raise ValueError("Missing MYSQL_URL/DATABASE_URL for building NLQ connection")
+
+    base = parse_mysql_cfg(admin_raw)
+
+    nlq_user = os.getenv("NLQ_USER", "nlq_user").strip()
+    nlq_pass = os.getenv("NLQ_PASSWORD", "").strip()
+    if not nlq_pass:
+        raise ValueError("NLQ_PASSWORD is missing")
+
+    nlq_url = URL.create(
+        drivername="mysql+mysqlconnector",
+        username=nlq_user,
+        password=nlq_pass,
+        host=base.host,
+        port=base.port,
+        database=db_name,
+    )
+    return str(nlq_url)
 
 
 # ----------------------------
-# OpenAI / SQL helpers
+# MySQL provisioning helpers
 # ----------------------------
-def get_llm(api_key: str, model: str, temperature: float = 0.0) -> ChatOpenAI:
-    return ChatOpenAI(api_key=api_key, model=model, temperature=temperature)
+def admin_mysql_connect(cfg: DbCfg):
+    return mysql.connector.connect(
+        host=cfg.host,
+        port=cfg.port,
+        user=cfg.username,
+        password=cfg.password,
+        autocommit=True,
+    )
+
+
+def create_database_if_needed(cfg: DbCfg, db_name: str) -> None:
+    conn = admin_mysql_connect(cfg)
+    try:
+        cur = conn.cursor()
+        cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}`;")
+        cur.close()
+    finally:
+        conn.close()
+
+
+def ensure_nlq_user_and_grants(cfg: DbCfg, db_name: str, nlq_user: str, nlq_pass: str) -> None:
+    """
+    Creates or updates nlq_user and grants SELECT only on db_name.
+    Works on MySQL 8+.
+    """
+    conn = admin_mysql_connect(cfg)
+    try:
+        cur = conn.cursor()
+
+        # Create user if not exists, else update password
+        cur.execute(f"CREATE USER IF NOT EXISTS '{nlq_user}'@'%' IDENTIFIED BY %s;", (nlq_pass,))
+        cur.execute(f"ALTER USER '{nlq_user}'@'%' IDENTIFIED BY %s;", (nlq_pass,))
+
+        # Grant read-only
+        cur.execute(f"GRANT SELECT ON `{db_name}`.* TO '{nlq_user}'@'%';")
+        cur.execute("FLUSH PRIVILEGES;")
+
+        cur.close()
+    finally:
+        conn.close()
+
+
+# ----------------------------
+# LLM helpers
+# ----------------------------
+def get_llm() -> ChatOpenAI:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY missing")
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    return ChatOpenAI(api_key=api_key, model=model, temperature=0.0)
 
 
 def extract_sql(text_out: str) -> str:
-    m = SQL_CODEBLOCK_RE.search(text_out or "")
-    if m:
-        return m.group(1).strip()
-    return (text_out or "").strip()
+    m = SQL_CODEBLOCK_RE.search(text_out)
+    return (m.group(1).strip() if m else text_out.strip())
 
 
 def normalize_sql(sql: str) -> str:
-    s = (sql or "").strip().rstrip(";").strip()
+    s = sql.strip().rstrip(";").strip()
     return s + ";"
 
 
 def is_read_only_sql(sql: str) -> bool:
-    s = (sql or "").strip()
+    s = sql.strip()
     low = re.sub(r"\s+", " ", s.lower())
-
     if not (low.startswith("select") or low.startswith("with")):
         return False
-
     blocked = [
         "insert", "update", "delete", "drop", "alter", "truncate", "create", "replace",
         "grant", "revoke", "commit", "rollback",
@@ -109,13 +216,10 @@ def is_read_only_sql(sql: str) -> bool:
 def ensure_limit(sql: str, default_limit: int = 200) -> str:
     s = normalize_sql(sql)
     low = re.sub(r"\s+", " ", s.lower())
-
     if re.search(r"\blimit\s+\d+\b", low):
         return s
-
     if low.startswith("select") and ("count(" not in low):
         return s.rstrip(";") + f" LIMIT {default_limit};"
-
     return s
 
 
@@ -127,7 +231,6 @@ def fetch_schema_summary(engine: Engine, db_name: str, max_tables: int = 200) ->
         ORDER BY TABLE_NAME, ORDINAL_POSITION
     """)
     df = pd.read_sql(q, engine, params={"db": db_name})
-
     if df.empty:
         return "(No tables found in this database yet.)"
 
@@ -145,23 +248,13 @@ def generate_sql_from_question(llm: ChatOpenAI, schema: str, question: str) -> s
     system = (
         "You are a senior data analyst writing MySQL queries.\n"
         "Rules:\n"
-        "- Return ONLY the SQL query (no explanation).\n"
-        "- SQL MUST be read-only (SELECT or WITH only).\n"
+        "- Return ONLY the SQL query.\n"
+        "- Must be read-only (SELECT or WITH only).\n"
         "- Use the provided schema.\n"
-        "- If ambiguous, make a reasonable assumption.\n"
     )
-
-    user = (
-        f"SCHEMA:\n{schema}\n\n"
-        f"QUESTION:\n{question}\n\n"
-        "Return ONLY SQL."
-    )
-
-    raw = llm.invoke(
-        [{"role": "system", "content": system}, {"role": "user", "content": user}]
-    ).content
-
-    sql = ensure_limit(normalize_sql(extract_sql(raw)), default_limit=200)
+    user = f"SCHEMA:\n{schema}\n\nQUESTION:\n{question}\n\nReturn ONLY SQL."
+    raw = llm.invoke([{"role": "system", "content": system}, {"role": "user", "content": user}]).content
+    sql = ensure_limit(normalize_sql(extract_sql(raw)), 200)
     return sql
 
 
@@ -170,268 +263,119 @@ def run_sql_to_df(engine: Engine, sql: str) -> pd.DataFrame:
 
 
 # ----------------------------
-# Admin ops (root)
-# ----------------------------
-def mysql_connect(host: str, port: int, user: str, password: str, database: Optional[str] = None):
-    return mysql.connector.connect(
-        host=host,
-        port=int(port),
-        user=user,
-        password=password,
-        database=database,
-        autocommit=False,
-    )
-
-
-def create_database(host: str, port: int, user: str, password: str, db_name: str) -> None:
-    conn = mysql_connect(host, port, user, password, database=None)
-    cur = conn.cursor()
-    cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}`;")
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def ensure_nlq_user(
-    host: str,
-    port: int,
-    root_user: str,
-    root_password: str,
-    db_name: str,
-    nlq_user: str,
-    nlq_password: str,
-) -> None:
-    """
-    Create or reset NLQ user and grant SELECT only.
-    Uses wildcard host '%' because Railway service-to-service traffic does not come from localhost.
-    """
-    conn = mysql_connect(host, port, root_user, root_password, database=None)
-    cur = conn.cursor()
-
-    cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}`;")
-
-    # Create user for any host
-    cur.execute(f"CREATE USER IF NOT EXISTS '{nlq_user}'@'%' IDENTIFIED BY %s;", (nlq_password,))
-    # Reset password to be safe
-    cur.execute(f"ALTER USER '{nlq_user}'@'%' IDENTIFIED BY %s;", (nlq_password,))
-
-    # Read-only grants
-    cur.execute(f"GRANT SELECT ON `{db_name}`.* TO '{nlq_user}'@'%';")
-    cur.execute("FLUSH PRIVILEGES;")
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def import_sql_file(host: str, port: int, user: str, password: str, db_name: str, sql_text: str) -> int:
-    """
-    Import SQL into db_name using mysql-connector multi=True.
-    Works for typical schema/data dumps (no DELIMITER/procedures).
-    """
-    conn = mysql_connect(host, port, user, password, database=db_name)
-    cur = conn.cursor()
-    ok = 0
-    try:
-        for _ in cur.execute(sql_text, multi=True):
-            ok += 1
-        conn.commit()
-    except MySQLError:
-        conn.rollback()
-        raise
-    finally:
-        cur.close()
-        conn.close()
-    return ok
-
-
-# ----------------------------
 # Streamlit UI
 # ----------------------------
 st.set_page_config(page_title="NL → SQL (MySQL) Agent", layout="wide")
 st.title("Natural Language → SQL Agent (MySQL) — DataFrame Results")
 
-
-def read_env(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return default if v is None else v
-
-
 with st.sidebar:
-    st.header("OpenAI")
-    api_key = st.text_input("OPENAI_API_KEY", type="password", value=read_env("OPENAI_API_KEY"))
-    model = st.text_input("OPENAI_MODEL", value=read_env("OPENAI_MODEL", "gpt-4o-mini"))
+    st.header("Database (Railway)")
+
+    db_name = st.text_input(
+        "Target database name",
+        value=os.getenv("MYSQL_DEFAULT_DB", "chinook"),
+        help="This is the DB your queries will run against.",
+    )
+    db_name = _sanitize_db_name(db_name)
 
     st.divider()
-    st.header("Railway / MySQL URLs (recommended)")
+    st.subheader("Provision read-only user (NLQ)")
+    nlq_user = st.text_input("NLQ_USER", value=os.getenv("NLQ_USER", "nlq_user"))
+    nlq_pass = st.text_input("NLQ_PASSWORD", type="password", value=os.getenv("NLQ_PASSWORD", ""))
 
-    # Railway MySQL service provides MYSQL_URL (mysql://...)
-    mysql_url = st.text_input("MYSQL_URL", value=read_env("MYSQL_URL", ""), help="Railway: ${MySQL.MYSQL_URL}")
-    db_name = st.text_input("DB name", value=read_env("MYSQL_DEFAULT_DB", read_env("MYSQL_DATABASE", "railway")))
-
-    st.caption("If MYSQL_URL is empty, we fallback to host/port/user/password fields below.")
-
-    st.divider()
-    st.header("Fallback: Manual Connection")
-    mysql_host = st.text_input("MYSQL_HOST", value=read_env("MYSQL_HOST", read_env("MYSQLHOST", "mysql.railway.internal")))
-    mysql_port = st.text_input("MYSQL_PORT", value=read_env("MYSQL_PORT", read_env("MYSQLPORT", "3306")))
-    root_user = st.text_input("MYSQL_ROOT_USER", value=read_env("MYSQL_ROOT_USER", "root"))
-    root_pass = st.text_input("MYSQL_ROOT_PASSWORD", type="password", value=read_env("MYSQL_ROOT_PASSWORD", read_env("MYSQLPASSWORD", "")))
-
-    st.divider()
-    st.header("NLQ (read-only) user")
-    nlq_user = st.text_input("NLQ_USER", value=read_env("NLQ_USER", "nlq_user"))
-    nlq_pass = st.text_input("NLQ_PASSWORD", type="password", value=read_env("NLQ_PASSWORD", ""))
-
-    st.divider()
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
-        btn_test = st.button("Test Connections")
+        test_btn = st.button("Test Admin + NLQ")
     with c2:
-        btn_provision = st.button("Create/Grant NLQ")
-    with c3:
-        btn_create_db = st.button("Create DB")
+        grant_btn = st.button("Create/Grant NLQ")
 
     st.divider()
-    st.subheader("Optional: Import .sql into DB")
-    sql_upload = st.file_uploader("Upload a .sql file", type=["sql"])
-    btn_import = st.button("Import SQL")
+    st.caption("Tip: Ensure MYSQL_URL/DATABASE_URL points to Railway MySQL, and NLQ_PASSWORD is set.")
 
 
-def get_admin_connection_parts() -> Tuple[str, str, int, str, str]:
-    """
-    Returns (host, user, port, password, admin_sqlalchemy_url_with_db)
-    """
-    if mysql_url.strip():
-        base = normalize_sqlalchemy_mysql_url(mysql_url.strip())
-        # base may include db; replace with chosen db_name
-        url_db = url_with_db(base, db_name)
-        u = make_url(url_db)
-        return u.host, u.username, int(u.port or 3306), u.password or "", url_db
-
-    # Manual fallback
-    host = mysql_host.strip()
-    port = int(mysql_port.strip() or "3306")
-    user = root_user.strip() or "root"
-    pwd = root_pass
-    url_db = f"mysql+mysqlconnector://{quote_plus(user)}:{quote_plus(pwd)}@{host}:{port}/{db_name}"
-    return host, user, port, pwd, url_db
-
-
-def get_nlq_sqlalchemy_url(admin_host: str, admin_port: int) -> str:
-    """
-    NLQ uses host/port from the MySQL service, but user/pass from NLQ vars.
-    """
-    user = (nlq_user or "").strip()
-    pwd = nlq_pass or ""
-    if not user:
-        raise ValueError("NLQ_USER is empty")
-    if not pwd:
-        raise ValueError("NLQ_PASSWORD is empty")
-    return f"mysql+mysqlconnector://{quote_plus(user)}:{quote_plus(pwd)}@{admin_host}:{admin_port}/{db_name}"
-
-
-def test_engine(url: str) -> Optional[str]:
+def test_connection_sqlalchemy(sa_url: str) -> Optional[str]:
     try:
-        engine = create_engine(url, pool_pre_ping=True)
-        with engine.connect() as conn:
+        eng = create_engine(sa_url, pool_pre_ping=True)
+        with eng.connect() as conn:
             conn.execute(text("SELECT 1"))
         return None
     except Exception as e:
         return str(e)
 
 
-# Sidebar actions
-admin_host, admin_user, admin_port, admin_pwd, admin_url_db = get_admin_connection_parts()
-
-if btn_create_db:
+# --- Actions
+if test_btn:
     try:
-        create_database(admin_host, admin_port, admin_user, admin_pwd, db_name)
-        st.sidebar.success(f"Database `{db_name}` created (or already exists).")
-    except Exception as e:
-        st.sidebar.error(f"Create DB failed: {e}")
+        admin_url, admin_cfg = build_admin_url_and_cfg()
+        admin_err = test_connection_sqlalchemy(admin_url)
 
-if btn_provision:
+        if admin_err:
+            st.sidebar.error(f"Admin connection failed: {admin_err}")
+        else:
+            st.sidebar.success("Admin connection OK ✅")
+
+        if nlq_pass.strip():
+            nlq_url = build_nlq_url(db_name)
+            nlq_err = test_connection_sqlalchemy(nlq_url)
+            if nlq_err:
+                st.sidebar.error(f"NLQ connection failed: {nlq_err}")
+            else:
+                st.sidebar.success("NLQ connection OK ✅")
+        else:
+            st.sidebar.warning("NLQ_PASSWORD is empty, skipping NLQ test.")
+
+    except Exception as e:
+        st.sidebar.error(str(e))
+
+if grant_btn:
     try:
         if not nlq_pass.strip():
             st.sidebar.error("Set NLQ_PASSWORD first.")
         else:
-            ensure_nlq_user(
-                host=admin_host,
-                port=admin_port,
-                root_user=admin_user,
-                root_password=admin_pwd,
-                db_name=db_name,
-                nlq_user=nlq_user.strip(),
-                nlq_password=nlq_pass,
-            )
-            st.sidebar.success("NLQ user created/updated and granted SELECT ✅")
+            admin_url, admin_cfg = build_admin_url_and_cfg()
+            # create db
+            create_database_if_needed(admin_cfg, db_name)
+            # create/grant
+            ensure_nlq_user_and_grants(admin_cfg, db_name, nlq_user.strip(), nlq_pass.strip())
+            st.sidebar.success(f"NLQ user '{nlq_user}' created/updated and granted SELECT on `{db_name}` ✅")
     except Exception as e:
         st.sidebar.error(f"Provision NLQ failed: {e}")
-
-if btn_import:
-    if not sql_upload:
-        st.sidebar.warning("Upload a .sql file first.")
-    else:
-        try:
-            sql_text = sql_upload.getvalue().decode("utf-8", errors="replace")
-            # Ensure DB exists then import into it
-            create_database(admin_host, admin_port, admin_user, admin_pwd, db_name)
-            ok = import_sql_file(admin_host, admin_port, admin_user, admin_pwd, db_name, sql_text)
-            st.sidebar.success(f"Import finished. Statements executed: {ok}.")
-        except Exception as e:
-            st.sidebar.error(f"Import failed: {e}")
-            st.sidebar.info("If your .sql uses DELIMITER/stored procedures, import using MySQL Workbench or mysql CLI instead.")
-
-if btn_test:
-    admin_err = test_engine(admin_url_db)
-    if admin_err:
-        st.sidebar.error(f"Admin connection failed: {admin_err}")
-    else:
-        st.sidebar.success("Admin connection OK ✅")
-
-    try:
-        nlq_url = get_nlq_sqlalchemy_url(admin_host, admin_port)
-        nlq_err = test_engine(nlq_url)
-        if nlq_err:
-            st.sidebar.error(f"NLQ connection failed: {nlq_err}")
-        else:
-            st.sidebar.success("NLQ connection OK ✅")
-    except Exception as e:
-        st.sidebar.error(f"NLQ config error: {e}")
 
 
 # ----------------------------
 # Main: Ask question -> SQL -> DataFrame
 # ----------------------------
 st.subheader("Ask a question")
-question = st.text_area(
-    "Example: Which country’s customers spent the most by invoice?",
-    height=90,
-)
-
+question = st.text_area("Example: Top 10 customers by total spend?", height=90)
 run_btn = st.button("Run Query")
 
 if run_btn:
-    if not api_key.strip():
-        st.error("Please enter your OPENAI_API_KEY in the sidebar.")
+    if not question.strip():
+        st.warning("Please enter a question.")
         st.stop()
 
-    # NLQ engine first (read-only user)
+    # Build NLQ engine
     try:
-        nlq_url = get_nlq_sqlalchemy_url(admin_host, admin_port)
-        nlq_engine = create_engine(nlq_url, pool_pre_ping=True)
-        with nlq_engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        nlq_url = build_nlq_url(db_name)
+        nlq_err = test_connection_sqlalchemy(nlq_url)
+        if nlq_err:
+            st.error(f"Database connection failed (NLQ user): {nlq_err}")
+            st.info("Fix: Click Create/Grant NLQ in the sidebar, and ensure NLQ_PASSWORD is set.")
+            st.stop()
+        engine = create_engine(nlq_url, pool_pre_ping=True)
     except Exception as e:
-        st.error(f"Database connection failed (NLQ user): {e}")
-        st.info("Fix: Click **Create/Grant NLQ** in the sidebar, and ensure NLQ_PASSWORD is set.")
+        st.error(str(e))
         st.stop()
 
-    llm = get_llm(api_key=api_key, model=model, temperature=0.0)
+    # LLM
+    try:
+        llm = get_llm()
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
     with st.spinner("Reading schema..."):
-        schema = fetch_schema_summary(nlq_engine, db_name=db_name)
+        schema = fetch_schema_summary(engine, db_name)
 
     with st.spinner("Generating SQL..."):
         sql = generate_sql_from_question(llm, schema, question)
@@ -445,22 +389,21 @@ if run_btn:
 
     with st.spinner("Running query..."):
         try:
-            df = run_sql_to_df(nlq_engine, sql)
+            df = run_sql_to_df(engine, sql)
         except Exception as e:
             st.error(f"SQL execution failed: {e}")
             st.stop()
 
-    st.markdown("### Results (DataFrame)")
+    st.markdown("### Results")
     st.dataframe(df, use_container_width=True)
 
     with st.spinner("Summarizing results..."):
         preview = df.head(20).to_csv(index=False)
         summary_prompt = (
-            "Summarize the result for a business user in 2-5 bullet points.\n"
-            "If there are totals/rankings, mention the top items.\n\n"
+            "Summarize the result for a business user in 2-5 bullet points.\n\n"
             f"Question: {question}\n\n"
             f"SQL:\n{sql}\n\n"
-            f"CSV Preview (first rows):\n{preview}"
+            f"CSV Preview:\n{preview}"
         )
         summary = llm.invoke(summary_prompt).content
 
