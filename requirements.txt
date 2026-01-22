@@ -1,18 +1,21 @@
-# Core LLM + LangChain
-langchain==0.2.1
-langchain-community==0.2.1
-langchain-openai==0.1.8
-openai>=1.12.0
+# App
+streamlit==1.41.1
+pandas==2.2.3
 
-# Database connectivity
+# OpenAI
+openai==1.57.4
+langchain-openai==0.1.25
+
+# LangChain core
+langchain==0.2.17
+langchain-community==0.2.16
+langchain-core==0.2.41
+
+# DB
 mysql-connector-python==8.4.0
 SQLAlchemy>=2.0.29
 
-# Environment variable management
+# Env + utilities
 python-dotenv==1.0.1
-
-# CLI / utilities (safe defaults)
-pydantic>=2.6.0
-tenacity>=8.2.3
-streamlit
-pandas
+pydantic==2.10.3
+tenacity==8.5.0
