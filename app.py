@@ -16,42 +16,31 @@ from sqlalchemy.exc import SQLAlchemyError
 from langchain_openai import ChatOpenAI
 
 # ============================================================
-# 0) Critical Fixes:
-#    - Force SQLAlchemy to use mysql-connector-python (not MySQLdb)
-#    - Robustly parse/normalize Railway URLs
-#    - URL-encode username/password to avoid parse errors
+# 0) Connection helpers (Railway MySQL safe)
 # ============================================================
 
 def normalize_mysql_sqlalchemy_url(raw: str) -> str:
     """
-    Accepts common Railway/managed-MySQL URLs and returns a valid SQLAlchemy URL.
-
-    Fixes:
-      - mysql://... -> mysql+mysqlconnector://...
-      - mysql+mysqldb://... -> mysql+mysqlconnector://...
-      - strips accidental quotes/spaces
-      - URL-encodes username/password (handles @ : / ? # etc.)
-      - validates via SQLAlchemy make_url()
-
-    Raises:
-      ValueError if empty/None.
-      sqlalchemy.exc.ArgumentError if the URL is structurally invalid.
+    Convert Railway/standard MySQL URLs into a valid SQLAlchemy URL:
+      - mysql:// -> mysql+mysqlconnector://
+      - mysql+mysqldb:// -> mysql+mysqlconnector://
+      - strip quotes
+      - URL-encode username/password
+      - validate via SQLAlchemy make_url
     """
     if not raw:
         raise ValueError("Database URL is empty/None. Check Railway environment variables.")
 
     s = raw.strip().strip('"').strip("'")
 
-    # Force mysql-connector driver
     if s.startswith("mysql://"):
         s = s.replace("mysql://", "mysql+mysqlconnector://", 1)
     elif s.startswith("mysql+mysqldb://"):
         s = s.replace("mysql+mysqldb://", "mysql+mysqlconnector://", 1)
 
-    # Parse using SQLAlchemy
     u = make_url(s)
 
-    # Encode creds to avoid URL parsing problems when they contain special chars
+    # Encode credentials to handle special chars
     username = quote_plus(u.username) if u.username else None
     password = quote_plus(u.password) if u.password else None
     u = u.set(username=username, password=password)
@@ -59,10 +48,57 @@ def normalize_mysql_sqlalchemy_url(raw: str) -> str:
     return str(u)
 
 
+def build_url_from_discrete_vars() -> str:
+    """
+    Railway exposes MYSQLUSER/MYSQLPASSWORD/MYSQLHOST/MYSQLPORT/MYSQLDATABASE.
+    Use them as a fallback when MYSQL_PUBLIC_URL isn't used.
+    """
+    user = os.getenv("MYSQLUSER", "")
+    pw = os.getenv("MYSQLPASSWORD", "")
+    host = os.getenv("MYSQLHOST", "")
+    port = os.getenv("MYSQLPORT", "")
+    db = os.getenv("MYSQLDATABASE", "") or os.getenv("MYSQL_DATABASE", "")
+
+    if all([user, pw, host, port, db]):
+        # NOTE: we'll normalize+encode later
+        return f"mysql://{user}:{pw}@{host}:{port}/{db}"
+    return ""
+
+
+def pick_best_admin_url() -> str:
+    """
+    Railway best practice:
+      1) MYSQL_PUBLIC_URL (non-root, app-safe)
+      2) discrete vars (MYSQLUSER/MYSQLPASSWORD/...)
+      3) MYSQL_URL (often root; we will block root explicitly)
+    """
+    return (
+        os.getenv("MYSQL_PUBLIC_URL", "")
+        or build_url_from_discrete_vars()
+        or os.getenv("MYSQL_URL", "")
+        or ""
+    )
+
+
+def assert_not_root(url: str, label: str = "DB URL") -> None:
+    """
+    Railway commonly restricts root from remote/app connections.
+    If user is root, fail early with a helpful message.
+    """
+    u = make_url(url)
+    if (u.username or "").lower() == "root":
+        raise ValueError(
+            f"{label} is using user 'root'. Railway blocks root for app connections.\n"
+            f"Use MYSQL_PUBLIC_URL (recommended) or MYSQLUSER/MYSQLPASSWORD variables."
+        )
+
+
 @st.cache_resource(show_spinner=False)
-def get_engine(url: str) -> Engine:
-    safe_url = normalize_mysql_sqlalchemy_url(url)
-    return create_engine(safe_url, pool_pre_ping=True, pool_recycle=1800)
+def get_engine(sqlalchemy_url: str) -> Engine:
+    """
+    Cache is keyed by the URL string, so changing URL makes a new engine.
+    """
+    return create_engine(sqlalchemy_url, pool_pre_ping=True, pool_recycle=1800)
 
 
 def test_engine(engine: Engine) -> Tuple[bool, str]:
@@ -84,50 +120,32 @@ def extract_sql(text_out: str) -> str:
     m = SQL_CODEBLOCK_RE.search(text_out or "")
     return m.group(1).strip() if m else (text_out or "").strip()
 
-
 def normalize_sql(sql: str) -> str:
     s = (sql or "").strip()
     s = s.rstrip(";").strip()
     return s + ";"
 
-
 def is_read_only_sql(sql: str) -> bool:
-    """
-    Strong read-only guard:
-    - Must start with SELECT or WITH
-    - Must not contain any write/ddl keywords
-    """
     low = re.sub(r"\s+", " ", (sql or "").strip().lower())
     if not (low.startswith("select") or low.startswith("with")):
         return False
-
     blocked = [
         "insert", "update", "delete", "drop", "alter", "truncate", "create", "replace",
         "grant", "revoke", "commit", "rollback", "call", "load data", "outfile"
     ]
     return not any(re.search(rf"\b{re.escape(k)}\b", low) for k in blocked)
 
-
 def ensure_limit(sql: str, default_limit: int = 200) -> str:
-    """
-    Adds LIMIT only if there isn't one already and it isn't a pure COUNT query.
-    Avoids duplicate LIMIT like: LIMIT 200 LIMIT 200
-    """
     s = normalize_sql(sql)
     low = re.sub(r"\s+", " ", s.lower())
-
     if re.search(r"\blimit\s+\d+\b", low):
         return s
-
     if low.startswith("select") and ("count(" not in low):
         return s.rstrip(";") + f" LIMIT {default_limit};"
-
     return s
-
 
 def get_llm(api_key: str, model: str, temperature: float = 0.0) -> ChatOpenAI:
     return ChatOpenAI(api_key=api_key, model=model, temperature=temperature)
-
 
 def fetch_schema_summary(engine: Engine, db: str, max_tables: int = 200) -> str:
     q = text("""
@@ -137,7 +155,6 @@ def fetch_schema_summary(engine: Engine, db: str, max_tables: int = 200) -> str:
         ORDER BY TABLE_NAME, ORDINAL_POSITION
     """)
     df = pd.read_sql(q, engine, params={"db": db})
-
     lines = []
     for tname, g in df.groupby("TABLE_NAME"):
         cols = ", ".join(f"{r.COLUMN_NAME}({r.DATA_TYPE})" for r in g.itertuples(index=False))
@@ -146,7 +163,6 @@ def fetch_schema_summary(engine: Engine, db: str, max_tables: int = 200) -> str:
             lines.append("... (schema truncated)")
             break
     return "\n".join(lines)
-
 
 def generate_sql_from_question(llm: ChatOpenAI, schema: str, question: str) -> str:
     system = (
@@ -158,69 +174,28 @@ def generate_sql_from_question(llm: ChatOpenAI, schema: str, question: str) -> s
         "- If ambiguous, make a reasonable assumption.\n"
     )
     user = f"SCHEMA:\n{schema}\n\nQUESTION:\n{question}\n\nReturn ONLY SQL."
-
     raw = llm.invoke(
         [{"role": "system", "content": system},
          {"role": "user", "content": user}]
     ).content
-
     sql = extract_sql(raw)
     sql = normalize_sql(sql)
     sql = ensure_limit(sql, default_limit=200)
     return sql
-
 
 def run_sql_to_df(engine: Engine, sql: str) -> pd.DataFrame:
     return pd.read_sql(text(sql), engine)
 
 
 # ============================================================
-# 2) Optional: Provision a read-only NLQ user (only if admin allows)
-# ============================================================
-
-NLQ_USER_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
-
-def provision_nlq_user(engine_admin: Engine, db_name: str, nlq_user: str, nlq_password: str) -> None:
-    """
-    Creates nlq_user@'%' and grants SELECT on db.*.
-    NOTE: Some managed MySQL providers do NOT allow CREATE USER/GRANT from the app.
-    """
-    if not NLQ_USER_RE.match(nlq_user or ""):
-        raise ValueError("NLQ_USER must be alphanumeric/underscore (max 32 chars).")
-    if not nlq_password:
-        raise ValueError("NLQ_PASSWORD is empty.")
-
-    create_user_sql = f"CREATE USER IF NOT EXISTS `{nlq_user}`@'%' IDENTIFIED BY :pw;"
-    alter_user_sql = f"ALTER USER `{nlq_user}`@'%' IDENTIFIED BY :pw;"
-    grant_sql = f"GRANT SELECT ON `{db_name}`.* TO `{nlq_user}`@'%';"
-
-    with engine_admin.connect() as conn:
-        conn.execute(text(create_user_sql), {"pw": nlq_password})
-        conn.execute(text(alter_user_sql), {"pw": nlq_password})
-        conn.execute(text(grant_sql))
-        conn.execute(text("FLUSH PRIVILEGES;"))
-        conn.commit()
-
-
-# ============================================================
-# 3) Streamlit UI
+# 2) Streamlit UI
 # ============================================================
 
 st.set_page_config(page_title="NL → SQL (MySQL) Agent", layout="wide")
 st.title("Natural Language → SQL Agent (MySQL) — DataFrame Results")
 
-# --- Defaults from env (Railway-friendly)
-ENV_MYSQL_URL = (
-    os.getenv("MYSQL_PUBLIC_URL")
-    or os.getenv("MYSQL_URL")
-    or ""
-)
-
-ENV_DATABASE_URL = os.getenv("DATABASE_URL", "")
 ENV_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-ENV_NLQ_USER = os.getenv("NLQ_USER", "nlq_user")
-ENV_NLQ_PASSWORD = os.getenv("NLQ_PASSWORD", "")
+DEFAULT_ADMIN_RAW = pick_best_admin_url()
 
 with st.sidebar:
     st.header("OpenAI")
@@ -228,97 +203,63 @@ with st.sidebar:
     openai_model = st.text_input("OPENAI_MODEL", value=ENV_OPENAI_MODEL)
 
     st.divider()
-    st.header("MySQL URLs")
-    st.caption("Use Railway’s MYSQL_URL. This app converts mysql:// → mysql+mysqlconnector:// and safely encodes creds.")
+    st.header("MySQL Connection (Railway)")
+    st.caption(
+        "✅ Use MYSQL_PUBLIC_URL (recommended). "
+        "🚫 Do NOT use MYSQL_URL if it connects as root."
+    )
 
-    admin_url_input = st.text_input("MYSQL_URL (admin/app)", value=ENV_MYSQL_URL)
-    nlq_url_input = st.text_input("DATABASE_URL (read-only, optional)", value=ENV_DATABASE_URL)
+    admin_raw = st.text_input("MYSQL_PUBLIC_URL (or app-safe URL)", value=DEFAULT_ADMIN_RAW)
 
-    st.divider()
-    st.header("Optional: Read-only NLQ user")
-    use_nlq_user = st.checkbox("Use separate NLQ user for queries", value=False)
-    nlq_user = st.text_input("NLQ_USER", value=ENV_NLQ_USER, disabled=not use_nlq_user)
-    nlq_password = st.text_input("NLQ_PASSWORD", type="password", value=ENV_NLQ_PASSWORD, disabled=not use_nlq_user)
+    colA, colB = st.columns(2)
+    btn_clear_cache = colA.button("Clear DB Cache")
+    btn_test = colB.button("Test Connections")
 
-    cols = st.columns(2)
-    btn_test = cols[0].button("Test Connections")
-    btn_grant = cols[1].button("Create/Grant NLQ")
+    if btn_clear_cache:
+        st.cache_resource.clear()
+        st.rerun()
 
-# --- Validate admin URL
-if not (admin_url_input or "").strip():
-    st.error("MYSQL_URL is missing. Set it in Railway variables or paste it in the sidebar.")
+# --- Validate + normalize admin URL
+if not (admin_raw or "").strip():
+    st.error("Missing DB URL. In Railway, copy MYSQL_PUBLIC_URL and paste it here.")
     st.stop()
 
 try:
-    admin_url = normalize_mysql_sqlalchemy_url(admin_url_input)
-except Exception:
-    st.error("Could not parse MYSQL_URL. Make sure it looks like mysql://user:pass@host:port/db")
-    st.stop()
-
-# Parse admin URL to get DB name (for schema + grants)
-try:
-    admin_parsed = make_url(admin_url)
-    db_name = admin_parsed.database or (os.getenv("MYSQL_DATABASE") or "railway")
-except Exception:
-    st.error("Could not parse MYSQL_URL after normalization. Check the value in Railway variables.")
-    st.stop()
-
-engine_admin = get_engine(admin_url)
-
-# --- Decide which engine to use for querying
-# Priority:
-# 1) If DATABASE_URL provided (read-only url) -> use it
-# 2) If "use NLQ user" checked -> build URL from admin host/port/db + NLQ creds
-# 3) Else use admin/app MYSQL_URL directly
-query_url_raw = ""
-if (nlq_url_input or "").strip():
-    query_url_raw = nlq_url_input.strip()
-elif use_nlq_user and (nlq_user or "").strip() and (nlq_password or "").strip():
-    host = admin_parsed.host
-    port = admin_parsed.port or 3306
-
-    # Important: encode user/pass before building URL string
-    u_enc = quote_plus(nlq_user.strip())
-    p_enc = quote_plus(nlq_password.strip())
-
-    query_url_raw = f"mysql+mysqlconnector://{u_enc}:{p_enc}@{host}:{port}/{db_name}"
-else:
-    query_url_raw = admin_url
-
-try:
-    query_url = normalize_mysql_sqlalchemy_url(query_url_raw)
-    engine_query = get_engine(query_url)
+    admin_url = normalize_mysql_sqlalchemy_url(admin_raw)
+    assert_not_root(admin_url, label="Admin/app URL")
 except Exception as e:
-    st.error(f"Invalid query DB URL: {e}")
+    st.error(str(e))
     st.stop()
 
-# --- Actions
+admin_parsed = make_url(admin_url)
+db_name = admin_parsed.database or os.getenv("MYSQLDATABASE") or os.getenv("MYSQL_DATABASE") or "railway"
+
+# For this app, admin/query engines can be the same (read-only safety is enforced in SQL)
+engine_admin = get_engine(admin_url)
+engine_query = get_engine(admin_url)
+
+# Safe debug info (no passwords)
+with st.sidebar.expander("DB Debug (safe)", expanded=False):
+    st.write("Using user:", admin_parsed.username)
+    st.write("Host:", admin_parsed.host)
+    st.write("Port:", admin_parsed.port)
+    st.write("Database:", db_name)
+    st.write("MYSQL_PUBLIC_URL set:", bool(os.getenv("MYSQL_PUBLIC_URL")))
+    st.write("MYSQL_URL set:", bool(os.getenv("MYSQL_URL")))
+    st.write("MYSQLUSER set:", bool(os.getenv("MYSQLUSER")))
+
 if btn_test:
     okA, msgA = test_engine(engine_admin)
     okQ, msgQ = test_engine(engine_query)
-
     if okA:
         st.sidebar.success("Admin/app connection OK ✅")
     else:
         st.sidebar.error(f"Admin/app connection failed: {msgA}")
-
     if okQ:
         st.sidebar.success("Query connection OK ✅")
     else:
         st.sidebar.error(f"Query connection failed: {msgQ}")
 
-if btn_grant:
-    try:
-        provision_nlq_user(engine_admin, db_name=db_name, nlq_user=nlq_user, nlq_password=nlq_password)
-        st.sidebar.success(f"Granted SELECT to `{nlq_user}` on `{db_name}` ✅")
-    except Exception as e:
-        st.sidebar.error(f"Create/Grant NLQ failed: {e}")
-        st.sidebar.info(
-            "If your provider blocks CREATE USER/GRANT from apps, "
-            "leave 'Use separate NLQ user' OFF and just query using MYSQL_URL."
-        )
-
-# --- Show status
 with st.expander("Connection status", expanded=True):
     okA, msgA = test_engine(engine_admin)
     st.write(f"**Admin/app engine:** {'✅ OK' if okA else '❌ FAIL'}")
@@ -331,7 +272,7 @@ with st.expander("Connection status", expanded=True):
         st.code(msgQ)
 
 # ============================================================
-# 4) Main: Ask question -> SQL -> DataFrame
+# 3) Main: Ask question -> SQL -> DataFrame
 # ============================================================
 
 st.subheader("Ask a question")
