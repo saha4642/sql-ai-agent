@@ -14,3 +14,5 @@ python-dotenv==1.0.1
 # CLI / utilities (safe defaults)
 pydantic>=2.6.0
 tenacity>=8.2.3
+streamlit
+pandas
