@@ -19,9 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 # ============================================================
 
 def env_any(*names: str) -> str:
-    """
-    Return the first non-empty env var among names.
-    """
+    """Return the first non-empty env var among names."""
     for n in names:
         v = os.getenv(n)
         if v is not None and str(v).strip() != "":
@@ -30,74 +28,22 @@ def env_any(*names: str) -> str:
 
 
 # ============================================================
-# 1) URL normalization (SQLAlchemy + mysql-connector)
+# 1) Build DB URL from discrete vars (APP_* always wins)
+#    Uses PyMySQL driver to avoid caching_sha2 handshake issues.
 # ============================================================
 
-def normalize_mysql_sqlalchemy_url(raw: str) -> str:
+def build_raw_mysql_url_from_discrete_vars() -> str:
     """
-    Accepts common Railway/managed-MySQL URLs and returns a valid SQLAlchemy URL.
+    Build a mysql://user:pass@host:port/db URL from Railway discrete variables.
 
-    Fixes:
-      - mysql://... -> mysql+mysqlconnector://...
-      - mysql+mysqldb://... -> mysql+mysqlconnector://...
-      - strips accidental quotes/spaces
-      - URL-encodes username/password (handles @ : / ? # etc.)
-      - validates via SQLAlchemy make_url()
-
-    Raises:
-      ValueError if empty/None.
-      sqlalchemy.exc.ArgumentError if the URL is structurally invalid.
-    """
-    if not raw or str(raw).strip() == "":
-        raise ValueError("Database URL is empty/None. Check environment variables.")
-
-    s = str(raw).strip().strip('"').strip("'")
-
-    # Force mysql-connector driver
-    if s.startswith("mysql://"):
-        s = s.replace("mysql://", "mysql+mysqlconnector://", 1)
-    elif s.startswith("mysql+mysqldb://"):
-        s = s.replace("mysql+mysqldb://", "mysql+mysqlconnector://", 1)
-
-    # Parse using SQLAlchemy
-    u = make_url(s)
-
-    # Encode creds to avoid URL parsing problems when they contain special chars
-    username = quote_plus(u.username) if u.username else None
-    password = quote_plus(u.password) if u.password else None
-    u = u.set(username=username, password=password)
-
-    return str(u)
-
-
-def is_root_user(sqlalchemy_url: str) -> bool:
-    try:
-        u = make_url(sqlalchemy_url)
-        return (u.username or "").lower() == "root"
-    except Exception:
-        return False
-
-
-def assert_not_root(sqlalchemy_url: str, label: str = "DB URL") -> None:
-    if is_root_user(sqlalchemy_url):
-        raise RuntimeError(
-            f"{label} is using user 'root'. Railway blocks root for app connections. "
-            f"Use APP_MYSQL_USER/APP_MYSQL_PASSWORD (recommended) or non-root MYSQL_USER/MYSQL_PASSWORD."
-        )
-
-
-# ============================================================
-# 2) Build URL from discrete vars (FIXED precedence)
-# ============================================================
-
-def build_url_from_discrete_vars() -> str:
-    """
-    Builds a mysql://user:pass@host:port/db URL using discrete env vars.
-
-    CRITICAL FIX:
+    Precedence:
       - APP_MYSQL_USER / APP_MYSQL_PASSWORD ALWAYS win if present
-      - If fallback resolves to root -> return "" (hard block)
-      - Prefer MYSQL_DATABASE, then MYSQL_DB, then MYSQL_DEFAULT_DB
+      - Else fallback to MYSQL_USER/MYSQL_PASSWORD (often root; root blocked)
+
+    Requires:
+      - MYSQL_HOST (or MYSQLHOST)
+      - MYSQL_PORT (or MYSQLPORT)
+      - MYSQL_DATABASE (or MYSQL_DB or MYSQL_DEFAULT_DB)
     """
     app_user = (env_any("APP_MYSQL_USER") or "").strip()
     app_pw = (env_any("APP_MYSQL_PASSWORD") or "").strip()
@@ -110,13 +56,12 @@ def build_url_from_discrete_vars() -> str:
     else:
         user, pw = rail_user, rail_pw
 
-    # HARD BLOCK: never allow root from discrete vars
+    # Railway blocks root for app connections
     if (user or "").lower() == "root":
         return ""
 
     host = (env_any("MYSQL_HOST", "MYSQLHOST") or "").strip()
     port = (env_any("MYSQL_PORT", "MYSQLPORT") or "").strip()
-
     db = (
         (env_any("MYSQL_DATABASE") or "").strip()
         or (env_any("MYSQL_DB") or "").strip()
@@ -129,13 +74,58 @@ def build_url_from_discrete_vars() -> str:
     return ""
 
 
+def normalize_mysql_sqlalchemy_url(raw: str) -> str:
+    """
+    Convert raw MySQL URL into a SQLAlchemy URL using PyMySQL driver:
+      mysql://... -> mysql+pymysql://...
+
+    Also:
+      - strips quotes/spaces
+      - URL-encodes username/password
+      - validates via SQLAlchemy make_url()
+    """
+    if not raw or str(raw).strip() == "":
+        raise ValueError("Database URL is empty. Check Railway variables.")
+
+    s = str(raw).strip().strip('"').strip("'")
+
+    # Force PyMySQL driver (important)
+    if s.startswith("mysql+pymysql://"):
+        pass
+    elif s.startswith("mysql://"):
+        s = s.replace("mysql://", "mysql+pymysql://", 1)
+    else:
+        # If some other mysql+driver:// is provided, normalize to pymysql
+        s = re.sub(r"^mysql\+[^:]+://", "mysql+pymysql://", s, count=1)
+
+    u = make_url(s)
+
+    # Encode creds (handles special chars)
+    username = quote_plus(u.username) if u.username else None
+    password = quote_plus(u.password) if u.password else None
+    u = u.set(username=username, password=password)
+
+    return str(u)
+
+
+def assert_not_root(sqlalchemy_url: str) -> None:
+    u = make_url(sqlalchemy_url)
+    if (u.username or "").lower() == "root":
+        raise RuntimeError(
+            "Admin/app URL is using user 'root'. Railway blocks root for app connections. "
+            "Use APP_MYSQL_USER/APP_MYSQL_PASSWORD with a non-root user."
+        )
+
+
 # ============================================================
-# 3) SQLAlchemy engine helpers
+# 2) Engine helpers
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
 def get_engine(sqlalchemy_url: str) -> Engine:
     safe_url = normalize_mysql_sqlalchemy_url(sqlalchemy_url)
+    assert_not_root(safe_url)
+    # PyMySQL generally handles caching_sha2_password smoothly.
     return create_engine(safe_url, pool_pre_ping=True, pool_recycle=1800)
 
 
@@ -149,7 +139,7 @@ def test_engine(engine: Engine) -> Tuple[bool, str]:
 
 
 # ============================================================
-# 4) SQL safety + LLM helpers
+# 3) SQL safety + LLM helpers
 # ============================================================
 
 SQL_CODEBLOCK_RE = re.compile(r"```sql\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
@@ -167,11 +157,6 @@ def normalize_sql(sql: str) -> str:
 
 
 def is_read_only_sql(sql: str) -> bool:
-    """
-    Strong read-only guard:
-    - Must start with SELECT or WITH
-    - Must not contain any write/ddl keywords
-    """
     low = re.sub(r"\s+", " ", (sql or "").strip().lower())
     if not (low.startswith("select") or low.startswith("with")):
         return False
@@ -184,10 +169,6 @@ def is_read_only_sql(sql: str) -> bool:
 
 
 def ensure_limit(sql: str, default_limit: int = 200) -> str:
-    """
-    Adds LIMIT only if there isn't one already and it isn't a pure COUNT query.
-    Avoids duplicate LIMIT like: LIMIT 200 LIMIT 200
-    """
     s = normalize_sql(sql)
     low = re.sub(r"\s+", " ", s.lower())
 
@@ -201,7 +182,6 @@ def ensure_limit(sql: str, default_limit: int = 200) -> str:
 
 
 def get_llm(api_key: str, model: str, temperature: float = 0.0):
-    # Import here so the app can still boot even if OpenAI deps are misconfigured
     from langchain_openai import ChatOpenAI
     return ChatOpenAI(api_key=api_key, model=model, temperature=temperature)
 
@@ -252,13 +232,12 @@ def run_sql_to_df(engine: Engine, sql: str) -> pd.DataFrame:
 
 
 # ============================================================
-# 5) Streamlit UI
+# 4) Streamlit UI
 # ============================================================
 
 st.set_page_config(page_title="NL → SQL (MySQL) Agent", layout="wide")
 st.title("Natural Language → SQL Agent (MySQL) — DataFrame Results")
 
-# Sidebar: OpenAI
 with st.sidebar:
     st.header("OpenAI")
     openai_key = st.text_input("OPENAI_API_KEY", type="password", value=env_any("OPENAI_API_KEY"))
@@ -267,8 +246,9 @@ with st.sidebar:
     st.divider()
     st.header("MySQL (Railway)")
     st.caption(
-        "This app uses discrete Railway vars (MYSQL_HOST/PORT/DATABASE) and "
-        "prefers APP_MYSQL_USER/APP_MYSQL_PASSWORD. Root is blocked."
+        "Uses Railway discrete vars (MYSQL_HOST/PORT/DATABASE). "
+        "Prefers APP_MYSQL_USER/APP_MYSQL_PASSWORD. Root is blocked. "
+        "Driver: PyMySQL."
     )
 
     btn_clear = st.button("Clear DB Cache")
@@ -276,50 +256,38 @@ with st.sidebar:
 
     st.divider()
     st.header("DB Debug (safe)")
-    # show whether app creds are present (no secrets)
     st.write("APP_MYSQL_USER set:", bool(env_any("APP_MYSQL_USER")))
     st.write("APP_MYSQL_PASSWORD set:", bool(env_any("APP_MYSQL_PASSWORD")))
+    st.write("MYSQL_HOST set:", bool(env_any("MYSQL_HOST", "MYSQLHOST")))
+    st.write("MYSQL_PORT set:", bool(env_any("MYSQL_PORT", "MYSQLPORT")))
+    st.write("MYSQL_DATABASE set:", bool(env_any("MYSQL_DATABASE", "MYSQL_DB", "MYSQL_DEFAULT_DB")))
     st.write("MYSQL_USER present:", bool(env_any("MYSQL_USER", "MYSQLUSER")))
-    st.write("MYSQL_DATABASE present:", bool(env_any("MYSQL_DATABASE", "MYSQL_DB", "MYSQL_DEFAULT_DB")))
 
 if btn_clear:
     get_engine.clear()
     st.sidebar.success("DB cache cleared ✅")
 
-# ------------------------------------------------------------
-# Build DB URL (DISCRETE VARS ONLY) + hard block root
-# ------------------------------------------------------------
-raw_url = build_url_from_discrete_vars()
+raw_url = build_raw_mysql_url_from_discrete_vars()
 if not raw_url:
     st.error(
         "DB credentials invalid or root-only.\n\n"
         "Fix:\n"
-        "- Ensure APP_MYSQL_USER and APP_MYSQL_PASSWORD are set to your non-root user (e.g., app_ro)\n"
+        "- Ensure APP_MYSQL_USER and APP_MYSQL_PASSWORD are set to your non-root user\n"
         "- Ensure MYSQL_HOST, MYSQL_PORT, and MYSQL_DATABASE are set\n"
         "- If MYSQL_USER is 'root', it will be blocked unless APP_MYSQL_* is provided."
     )
     st.stop()
 
-# Normalize for SQLAlchemy + verify not root
 try:
     sqlalchemy_url = normalize_mysql_sqlalchemy_url(raw_url)
-    assert_not_root(sqlalchemy_url, label="Admin/app URL")
-except Exception as e:
-    st.error(str(e))
-    st.stop()
-
-# Parse URL to get DB name
-try:
     parsed = make_url(sqlalchemy_url)
     db_name = parsed.database or env_any("MYSQL_DATABASE") or env_any("MYSQL_DB") or env_any("MYSQL_DEFAULT_DB") or "railway"
-except Exception:
-    st.error("Could not parse DB name from URL.")
+except Exception as e:
+    st.error(f"Could not parse DB URL: {e}")
     st.stop()
 
-# Engine
 engine = get_engine(sqlalchemy_url)
 
-# Tests
 if btn_test:
     ok, msg = test_engine(engine)
     if ok:
@@ -327,7 +295,6 @@ if btn_test:
     else:
         st.sidebar.error(f"DB connection failed: {msg}")
 
-# Connection status
 with st.expander("Connection status", expanded=True):
     try:
         u_dbg = make_url(sqlalchemy_url)
@@ -340,10 +307,6 @@ with st.expander("Connection status", expanded=True):
     st.write(f"**Engine:** {'✅ OK' if ok else '❌ FAIL'}")
     if not ok:
         st.code(msg)
-
-# ============================================================
-# 6) Main: Ask question -> SQL -> DataFrame
-# ============================================================
 
 st.subheader("Ask a question")
 question = st.text_area(

@@ -13,3 +13,4 @@ SQLAlchemy>=2.0.29
 python-dotenv==1.0.1
 pydantic==2.10.3
 tenacity==8.5.0
+pymysql==1.1.1
