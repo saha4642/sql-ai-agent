@@ -19,6 +19,16 @@ from langchain_openai import ChatOpenAI
 st.set_page_config(page_title="NL → SQL (MySQL) Agent", layout="wide")
 
 # ============================================================
+# OpenAI config (HIDDEN: no Streamlit input for API key)
+# ============================================================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+
+if not OPENAI_API_KEY:
+    st.error("OPENAI_API_KEY is not set in Railway environment variables.")
+    st.stop()
+
+# ============================================================
 # 0) DB URL build (Railway-friendly, non-root)
 # ============================================================
 
@@ -84,7 +94,6 @@ def list_databases(_engine: Engine) -> List[str]:
     dbs = sorted(df.iloc[:, 0].astype(str).tolist())
     hide = {"information_schema", "performance_schema", "mysql", "sys"}
     return [d for d in dbs if d not in hide]
-
 
 
 # ============================================================
@@ -247,9 +256,8 @@ def run_sql_to_df(engine: Engine, db: str, sql: str) -> pd.DataFrame:
 st.title("Natural Language → SQL Agent (MySQL) — DataFrame Results")
 
 with st.sidebar:
-    st.header("OpenAI")
-    openai_key = st.text_input("OPENAI_API_KEY", type="password", value=os.getenv("OPENAI_API_KEY", ""))
-    openai_model = st.text_input("OPENAI_MODEL", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    # OpenAI key input removed; show model only (optional)
+    st.caption(f"Model: {OPENAI_MODEL}")
 
     st.divider()
     st.header("MySQL (Railway)")
@@ -347,15 +355,12 @@ question = st.text_area(
 run_btn = st.button("Run Query")
 
 if run_btn:
-    if not openai_key.strip():
-        st.error("Missing OPENAI_API_KEY.")
-        st.stop()
-
+    # OpenAI key is now only from env
     if not schema.tables:
         st.warning(f"Database `{selected_db}` has no tables. Create/import tables first, then ask questions.")
         st.stop()
 
-    llm = get_llm(api_key=openai_key, model=openai_model, temperature=0.0)
+    llm = get_llm(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, temperature=0.0)
 
     # Try up to 3 attempts to avoid hallucinated tables
     last_err: Optional[str] = None
