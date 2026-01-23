@@ -328,7 +328,6 @@ if run_btn:
         st.error("Failed to produce a working query after 3 attempts. Try a simpler question or inspect schema.")
         if last_err:
             st.code(last_err)
-from __future__ import annotations
 
 import io
 import os
