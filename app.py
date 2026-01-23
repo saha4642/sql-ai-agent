@@ -246,13 +246,10 @@ def run_sql_to_df(engine: Engine, db: str, sql: str) -> pd.DataFrame:
 
 st.title("Natural Language → SQL Agent (MySQL) — DataFrame Results")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-if not OPENAI_API_KEY:
-    st.error("OPENAI_API_KEY is not set in environment variables.")
-    st.stop()
-
+with st.sidebar:
+    st.header("OpenAI")
+    openai_key = st.text_input("OPENAI_API_KEY", type="password", value=os.getenv("OPENAI_API_KEY", ""))
+    openai_model = st.text_input("OPENAI_MODEL", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 
     st.divider()
     st.header("MySQL (Railway)")
@@ -358,7 +355,7 @@ if run_btn:
         st.warning(f"Database `{selected_db}` has no tables. Create/import tables first, then ask questions.")
         st.stop()
 
-    llm = get_llm(api_key=OPENAI_API_KEY, model=OPENAI_MODEL, temperature=0.0)
+    llm = get_llm(api_key=openai_key, model=openai_model, temperature=0.0)
 
     # Try up to 3 attempts to avoid hallucinated tables
     last_err: Optional[str] = None
