@@ -79,15 +79,12 @@ def test_engine(engine: Engine) -> Tuple[bool, str]:
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def list_databases(engine: Engine) -> List[str]:
-    """
-    Auto-populates dropdown with any DB the current user can SEE.
-    New DBs (sakila/chinook/etc.) will appear after TTL or when you press Refresh.
-    """
-    df = pd.read_sql(text("SHOW DATABASES"), engine)
+def list_databases(_engine: Engine) -> List[str]:
+    df = pd.read_sql(text("SHOW DATABASES"), _engine)
     dbs = sorted(df.iloc[:, 0].astype(str).tolist())
     hide = {"information_schema", "performance_schema", "mysql", "sys"}
     return [d for d in dbs if d not in hide]
+
 
 
 # ============================================================
